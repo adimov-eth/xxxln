@@ -1,0 +1,34 @@
+Here's the English translation and explanation of these components:
+
+Depository
+The smart contract that manages reserves, channels, and disputes.
+Server
+
+A Server is the root machine initially created for each user - their personal unique machine.
+Every 100 milliseconds, it aggregates all incoming requests/messages and forms a block with a transaction map.
+Sends this block/map to signers for signature.
+Each signer creates their own block where they change their state according to received data.
+The server waits for finalized blocks from all signers, aggregates these blocks into a Merkle tree, updates its state, and finalizes the block.
+Forms a set of messages that need to be sent to other servers.
+Distributes these messages to other servers.
+
+
+Signer
+
+A Signer encapsulates all entities associated with a specific private key.
+Its root machine stores the private key used for signing transactions.
+The Signer receives messages from other signers and directs them to Entities. Signers communicate with each other as representatives of certain entities.
+Signer is a parent or super-machine for Entities. They handle entity-level consensus, which can be automatic if consisting of a single signer acting as both proposer and validator for that entity.
+Or a signer, as a DAO participant, can act as a proposer, validator, or observer.
+
+
+Entity
+
+An Entity is essentially an account abstraction. An entity can be anything, for example: a personal wallet, company wallet (DAO), payment hub/exchange, and essentially decentralized applications of any complexity.
+All entity management always happens through a proposal mechanism. A quorum of signers decides all entity management issues.
+
+
+Channel
+
+A Channel is an abstraction for message transmission between entities. It's essentially a machine that is replicated in both entities.
+The channel is effectively a bilateral account.

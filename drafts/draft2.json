@@ -1,0 +1,124 @@
+{
+    "nodes": [
+      {
+        "id": "node_1735502383165_b2ggg40uu",
+        "state": {
+          "balances": {
+            "ETH": "10000000000000000000",
+            "USDC": "10000000000"
+          },
+          "channels": {
+            "channel_1735502438241": {
+              "id": "channel_1735502438241",
+              "participants": [
+                "node_1735502383165_j88ivyd5h",
+                "node_1735502383168_cglm4xzr5"
+              ],
+              "token": "ETH",
+              "balances": {
+                "ETH": {
+                  "node_1735502383165_j88ivyd5h": "1000000000000000000",
+                  "node_1735502383168_cglm4xzr5": "1000000000000000000"
+                }
+              },
+              "status": "ACTIVE",
+              "nonce": 1,
+              "lastUpdate": 1735502438275,
+              "disputePeriod": 86400000,
+              "channelType": "BILATERAL"
+            }
+          }
+        }
+      },
+      {
+        "id": "node_1735502383165_j88ivyd5h",
+        "state": {
+          "balances": {
+            "ETH": "0",
+            "USDC": "1000000000"
+          },
+          "channels": {
+            "channel_1735502438241": {
+              "id": "channel_1735502438241",
+              "participants": [
+                "node_1735502383165_j88ivyd5h",
+                "node_1735502383168_cglm4xzr5"
+              ],
+              "token": "ETH",
+              "balances": {
+                "ETH": {
+                  "node_1735502383165_j88ivyd5h": "1000000000000000000",
+                  "node_1735502383168_cglm4xzr5": "1000000000000000000"
+                }
+              },
+              "status": "ACTIVE",
+              "nonce": 1,
+              "lastUpdate": 1735502438275,
+              "disputePeriod": 86400000,
+              "channelType": "BILATERAL"
+            }
+          }
+        }
+      },
+      {
+        "id": "node_1735502383168_cglm4xzr5",
+        "state": {
+          "balances": {
+            "ETH": "0",
+            "USDC": "1000000000"
+          },
+          "channels": {
+            "channel_1735502438241": {
+              "id": "channel_1735502438241",
+              "participants": [
+                "node_1735502383165_j88ivyd5h",
+                "node_1735502383168_cglm4xzr5"
+              ],
+              "token": "ETH",
+              "balances": {
+                "ETH": {
+                  "node_1735502383165_j88ivyd5h": "1000000000000000000",
+                  "node_1735502383168_cglm4xzr5": "1000000000000000000"
+                }
+              },
+              "status": "ACTIVE",
+              "nonce": 1,
+              "lastUpdate": 1735502438275,
+              "disputePeriod": 86400000,
+              "channelType": "BILATERAL"
+            }
+          }
+        }
+      },
+      {
+        "id": "node_1735502383168_6rhlrgrvk",
+        "state": {
+          "balances": {
+            "ETH": "1000000000000000000",
+            "USDC": "1000000000"
+          },
+          "channels": {}
+        }
+      },
+      {
+        "id": "node_1735502383168_v3hzstut6",
+        "state": {
+          "balances": {
+            "ETH": "1000000000000000000",
+            "USDC": "1000000000"
+          },
+          "channels": {}
+        }
+      },
+      {
+        "id": "node_1735502383168_f01p62jp4",
+        "state": {
+          "balances": {
+            "ETH": "1000000000000000000",
+            "USDC": "1000000000"
+          },
+          "channels": {}
+        }
+      }
+    ]
+  }
