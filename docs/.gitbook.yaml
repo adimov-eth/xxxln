@@ -6,5 +6,9 @@ structure:
 
 redirects:
   architecture/overview: architecture/overview.md
+  architecture/networking: architecture/networking.md
   implementation/state-management: implementation/state-management.md
-  technical/merkle: technical/merkle.md 
+  technical/database: technical/database.md
+  technical/merkle: technical/merkle.md
+  technical/consensus: technical/consensus.md
+  technical/storage: technical/storage.md 

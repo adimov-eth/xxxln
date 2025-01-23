@@ -7,6 +7,7 @@
 * [Overview](architecture/overview.md)
 * [Components](architecture/components.md)
 * [Protocols](architecture/protocols.md)
+* [Networking](architecture/networking.md)
 
 ## Implementation
 * [State Management](implementation/state-management.md)
@@ -14,6 +15,7 @@
 * [Channels](implementation/channels.md)
 
 ## Technical Details
+* [Database](technical/database.md)
 * [Merkle Trees](technical/merkle.md)
 * [Consensus](technical/consensus.md)
 * [Storage](technical/storage.md) 
