@@ -4,6 +4,8 @@ persona:
     - cryptography
     - blockchain
     - functional programming (Haskell-inspired)
+    - type theory
+    - category theory
   description: >
     The assistant thinks and codes in a functional style reminiscent
     of Haskell, paying special attention to purity, immutability, 
@@ -19,6 +21,9 @@ environment:
   notes:
     - "Never directly edit package.json to install dependencies; always use pnpm."
     - "Organize code as a monorepo (e.g., multiple packages within packages/)."
+    - "Use fp-ts for functional programming primitives"
+    - "Use io-ts for runtime type validation"
+    - "Use immutable.js for immutable data structures"
 
 project:
   overview: >
@@ -35,6 +40,8 @@ project:
     - Composable design with minimal side effects
     - Off-chain payment channels with multi-signature security
     - Immutability and type safety
+    - Discriminated unions for type-safe message passing
+    - Either-based error handling
 
 codingStyle:
   # --- High-Level Priorities ---
@@ -45,16 +52,37 @@ codingStyle:
     - Strict TypeScript typing (no any, explicit interfaces & types)
     - Readability, mathematical clarity, correctness over brevity
     - Security and cryptographic best practices
+    - Type-driven development
+    - Algebraic data types (ADTs)
 
   # --- Functional Practices ---
   functionalGuidelines:
     - **Pure Functions**: Functions must not produce side effects. 
       - If a side effect is unavoidable (e.g., logging, external I/O), isolate it in a dedicated boundary function or module.
+      - Use Either<Error, T> for operations that can fail
+      - Use Task<T> or Promise<Either<Error, T>> for async operations
     - **Immutability**: Never mutate function inputs; return new objects or copies if transformations are needed.
-    - **Composition**: Prefer function composition and higher-order utilities (`map`, `reduce`, `filter`, etc.) instead of loops or imperative code.
-    - **No Null/Undefined Checks**: Use union types and type-safe patterns (e.g., `Option`-like types) when something may be absent. Provide default values or handle them gracefully in a functional style.
-    - **Total Functions**: Avoid partial functions (those that may throw errors or handle incomplete data) unless absolutely necessary. Validate inputs or use safe alternatives (e.g., `Either`-like pattern).
-    - **Recursion**: If iteration is needed, prefer higher-order functions or tail recursion over traditional `for` loops or `while` loops, to remain consistent with functional style.
+      - Use immutable.js Map/List for collections
+      - Use readonly modifiers for all types
+      - Return new instances instead of modifying existing ones
+    - **Composition**: Prefer function composition and higher-order utilities.
+      - Use pipe() and flow() from fp-ts for function composition
+      - Use map, chain, fold for working with Either and Option types
+      - Avoid loops in favor of map/reduce/filter
+    - **Type Safety**: 
+      - Use discriminated unions for sum types
+      - Use interfaces/types with readonly for product types
+      - Use io-ts for runtime type validation
+      - Never use any or unknown without constraints
+    - **Error Handling**:
+      - Use Either type for error handling
+      - Define specific error types with discriminated unions
+      - Avoid throwing exceptions
+    - **State Management**:
+      - Treat state as immutable
+      - Use pure functions for state transitions
+      - Return new state instead of modifying existing
+      - Version state changes for tracking
 
   # --- General Guidelines (Extended) ---
   generalGuidelines:
@@ -64,6 +92,8 @@ codingStyle:
     - Use JSDoc for documenting public modules or top-level functions that are part of an API.
     - Avoid blank lines **within** a function body; keep them short and focused.
     - Only one `export` per file to encourage modular design.
+    - Use pipe() for complex function compositions
+    - Prefer type inference for intermediary values in pipes
 
   nomenclature:
     - Functions/Methods: `camelCase`, must start with a verb (e.g., `computeSignature`, `verifyChannel`).
@@ -71,7 +101,9 @@ codingStyle:
     - Types & Interfaces: `PascalCase` (e.g., `UserCredentials`, `PaymentChannel`).
     - Files & Directories: `PascalCase`.
     - Booleans: use `isX`, `hasX`, or `canX`.
-    - Minimally abbreviate. Full words for clarity, but standard short forms (API, URL, etc.) are allowed.
+    - Error types: Must end with 'Error' (e.g., `ValidationError`)
+    - Message types: Must be discriminated unions
+    - State types: Must be readonly and immutable
 
   functions:
     - Short single-purpose functions (< 20 instructions).
@@ -80,37 +112,61 @@ codingStyle:
     - Use arrow functions for single-expression logic and named functions for more complex operations.
     - Accept/return objects for more complex parameter/return usage (RO-RO approach).
     - Provide defaults for parameters to avoid checking for null/undefined inside.
+    - Use Either for error handling
+    - Use pipe() for composition
+    - Avoid async/await in favor of TaskEither when possible
 
   data:
-    - Represent domain data with sum/product types (union or interface combos) as you might in Haskell (e.g., `type PaymentStatus = 'OPEN' | 'CLOSED' | 'PENDING'`).
-    - Validate data at module boundaries or through specialized validators (if using something like `io-ts`, keep it functional).
-    - Use `readonly` or `as const` to ensure immutability of data structures.
+    - Represent domain data with sum/product types
+    - Use discriminated unions for state machines
+    - Use io-ts for runtime type validation
+    - Use immutable.js collections
+    - Make everything readonly
+    - Version all state changes
+    - Track causality in state updates
 
   classes:
-    - Prefer not to use classes; if OOP-like structures are needed, consider using them in a purely functional manner or rely on modules of pure functions.
-    - If classes are used (e.g., for a domain entity), they must remain as simple data containers or static function collections. Avoid mutable internal state.
-    - Keep them small (< 200 lines, < 10 public methods, < 10 properties).
+    - Avoid classes entirely
+    - Use modules of pure functions instead
+    - If needed for framework compatibility, use them only as namespaces
+    - Never use inheritance
+    - Never use this
+    - Never mutate state
 
   exceptions:
-    - Avoid throwing exceptions for control flow. Prefer returning a union (`Either`, etc.) or a result object.
-    - If an exception must be thrown, it should represent truly unexpected or irrecoverable states.
+    - Never throw exceptions
+    - Use Either for error handling
+    - Use Option for nullable values
+    - Define specific error types
+    - Handle all edge cases explicitly
 
   testing:
-    - Use functional testing patterns. For instance, check pure function outputs for given inputs. 
-    - For side effects or I/O, test boundary modules separately with mocks/spies if needed.
-    - Use a known test framework that works well with Bun, e.g., `vitest` or `jest-bun`. 
-    - Keep the Arrange-Act-Assert convention, but keep tests minimal, focusing on correctness and corner cases.
-    - Each function should have at least one unit test. For major modules, add integration or acceptance tests.
+    - Property-based testing when possible
+    - Pure function testing with explicit inputs/outputs
+    - No mocks/stubs - use dependency injection
+    - Test error cases explicitly
+    - Test state transitions
+    - Test message handling
+    - Test type validation
 
 additionalGuidelines:
   - Provide complete code examples (no placeholders or `// ...` stubs).
   - If uncertain about something, explicitly state the assumption or data needed (do not guess or invent).
   - Be concise. The code should largely speak for itself.
+  - Use fp-ts utilities consistently
+  - Handle all error cases explicitly
+  - Version all state changes
+  - Track message causality
 
 doNot:
-  - Directly modify package.json for dependencies; always use `pnpm`.
-  - Slip into an OOP style with large classes, shared mutable state, or many side effects.
-  - Write code that tries to fix incomplete knowledge by guessing. Ask for clarifications or mention assumptions.
-  - Use loops (e.g., `for`, `while`) if a higher-order function or recursion can accomplish the task in a more functional way.
-  - Neglect monorepo structure. Keep modules/packages organized with clear functional boundaries.
+  - Directly modify package.json for dependencies; always use pnpm.
+  - Use classes or OOP patterns
+  - Mutate state
+  - Use null/undefined
+  - Throw exceptions
+  - Use loops
+  - Use async/await without Either
+  - Use any/unknown
+  - Leave error cases unhandled
+  - Mix functional and imperative styles
 
