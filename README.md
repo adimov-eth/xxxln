@@ -11,106 +11,86 @@ A scalable, decentralized payment network built on an actor-based architecture w
 - 🔄 Event-driven state management
 - 🌐 Distributed consensus mechanism
 
-## Architecture
+## Documentation
 
-### Core Components
+### Architecture
+- [Overview](docs/architecture/overview.md) - High-level system architecture
+- [Components](docs/architecture/components.md) - Detailed component descriptions
+- [Protocols](docs/architecture/protocols.md) - Communication and consensus protocols
 
-#### 1. Actor Types
-- **Signer Machine (Root)**: Base level machine for individual signers
-- **Entity Machine**: Multi-signature or DAO-like structures
-- **Channel Machine**: Payment channels between parties
-- **Depository Machine**: Manages reserve assets and collateral
+### Implementation
+- [State Management](docs/implementation/state-management.md)
+- [Entities](docs/implementation/entities.md)
+- [Channels](docs/implementation/channels.md)
 
-#### 2. Communication Channels
-Each entity maintains four communication channels:
-- Transaction Inbox (TX In)
-- Transaction Outbox (TX Out)
-- Event Inbox
-- Event Outbox
+### Technical Details
+- [Merkle Trees](docs/technical/merkle.md)
+- [Consensus](docs/technical/consensus.md)
+- [Storage](docs/technical/storage.md)
 
+## Repository Structure
+```
+packages/
+├── contracts/    # Smart contracts
+├── node/        # Node implementation
+├── types/       # TypeScript types
+├── webapp/      # Web interface
+└── devtools/    # Development tools
 
-### Basic Usage
+docs/
+├── architecture/  # System architecture
+├── implementation/# Implementation details
+└── technical/     # Technical specifications
+```
 
-#### 1. Create a Signer Entity
+## Getting Started
+
+### Prerequisites
+- Node.js 16+
+- TypeScript 4.5+
+- Ethereum development environment
+
+### Installation
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/payment-network.git
+
+# Install dependencies
+yarn install
+
+# Build all packages
+yarn build
+
+# Run tests
+yarn test
+```
+
+### Quick Start
 ```typescript
 import { SignerMachine } from '@payment-network/node';
 
+// Create a signer
 const signer = await SignerMachine.create({
   privateKey: '0x...',
   network: 'testnet'
 });
-```
 
-#### 2. Create a Multi-Signature Entity
-```typescript
-const multiSig = await signer.createEntity({
-  signers: ['0xAddress1', '0xAddress2'],
-  threshold: 2
+// Create an entity
+const entity = await signer.createEntity({
+  name: 'MyEntity',
+  threshold: 1
 });
-```
 
-#### 3. Open a Payment Channel
-```typescript
-const channel = await multiSig.openChannel({
+// Open a payment channel
+const channel = await entity.openChannel({
   counterparty: '0xCounterpartyAddress',
   deposit: '1.0',
   token: 'ETH'
 });
 ```
 
-## Core Concepts
+## Contributing
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
-### Multi-Signature Entities
-Multi-signature entities (e.g., A-B) are created by combining two or more entities. They require multiple signatures for transactions based on a predefined threshold.
-
-```typescript
-interface IMultiSigEntity {
-  signers: string[];
-  threshold: number;
-  proposeTransaction(tx: Transaction): Promise<void>;
-  collectSignatures(txId: string): Promise<string[]>;
-}
-```
-
-### State Management
-The system uses a Hierarchical State-Time Machine (HSTM) for managing state:
-
-```typescript
-interface IMachineState {
-  blockTime: number;
-  board: {
-    threshold: number;
-    signers: Array<{
-      address: string;
-      weight: number;
-    }>;
-  };
-  reserves: Record<string, bigint>;
-  nonces: Record<string, number>;
-  proposals: Proposal[];
-  children: string[];
-}
-```
-
-### Message Flow
-1. Transactions flow upward through entity hierarchy
-2. Events flow downward from parent to child entities
-3. All messages are processed through respective inboxes/outboxes
-
-## Advanced Features
-
-### Payment Channels
-- Off-chain state updates
-- Dispute resolution mechanism
-- Hash Time Locked Contracts (HTLCs) for atomic swaps
-
-### Consensus Mechanism
-- Multi-signature validation
-- Proposal-based governance
-- Threshold signature schemes
-
-### Security Features
-- Cryptographic message signing
-- Secure state transitions
-- Dispute resolution protocol
-- Byzantine fault tolerance
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

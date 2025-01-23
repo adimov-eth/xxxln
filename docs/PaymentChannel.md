@@ -1,1 +1,0 @@
-A payment channel is a mechanism that allows two or more participants to conduct multiple transactions off-chain while only settling the final net result on-chain, significantly reducing fees and increasing transaction speed. The channel is secured by collateral locked in the Depository contract and requires participant signatures to update its state.
