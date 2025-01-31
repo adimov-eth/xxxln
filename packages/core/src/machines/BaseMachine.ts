@@ -33,6 +33,12 @@ export interface BaseMachine {
     // Event handling
     handleEvent(event: Message<unknown>): Promise<Either<MachineError, void>>;
     
+    // New ephemeral method for local state updates:
+    handleEventLocal(
+        state: BaseMachineState,
+        event: Message<unknown>
+    ): Promise<Either<MachineError, BaseMachineState>>;
+    
     // Blockchain functions
     produceBlock(): Promise<Either<MachineError, Block>>;
     receiveBlock(block: Block): Promise<Either<MachineError, void>>;
@@ -86,147 +92,124 @@ export abstract class AbstractBaseMachine implements BaseMachine {
     abstract handleEvent(event: Message<unknown>): Promise<Either<MachineError, void>>;
     abstract verifyStateTransition(from: BaseMachineState, to: BaseMachineState): Either<MachineError, boolean>;
 
+    // New abstract ephemeral method:
+    public abstract handleEventLocal(
+        state: BaseMachineState,
+        event: Message<unknown>
+    ): Promise<Either<MachineError, BaseMachineState>>;
+
     // Common blockchain functionality
     async produceBlock(): Promise<Either<MachineError, Block>> {
         try {
-            // Get pending transactions
             const transactions = this._mempool.pending.valueSeq().toArray().map(entry => entry.transaction);
             if (transactions.length === 0) {
-                return left(createMachineError(
-                    'INTERNAL_ERROR',
-                    'No transactions to process'
-                ));
+                return left(createMachineError('INTERNAL_ERROR', 'No transactions to process'));
             }
 
-            // Create new state by applying transactions
-            let newState = { ...this._state };
+            // Use an ephemeral copy for transaction application
+            let ephemeralState = { ...this._state };
             for (const tx of transactions) {
-                const result = await this.handleEvent(tx);
-                if (result._tag === 'Left') {
-                    continue; // Skip failed transactions
+                const result = await this.handleEventLocal(ephemeralState, tx);
+                if (result._tag === 'Right') {
+                    ephemeralState = result.right;
                 }
+                // If Left, skip the failed transaction
             }
 
             // Update block height and compute new state root
-            newState.blockHeight += 1;
-            const stateRootResult = this.computeStateRoot();
+            ephemeralState.blockHeight += 1;
+            const stateRootResult = this.computeStateRootFrom(ephemeralState);
             if (stateRootResult._tag === 'Left') {
                 return left(stateRootResult.left);
             }
-            newState.stateRoot = stateRootResult.right;
+            ephemeralState.stateRoot = stateRootResult.right;
 
-            // Create block header
             const header: BlockHeader = {
-                height: newState.blockHeight,
+                height: ephemeralState.blockHeight,
                 prevHash: this._state.latestHash,
                 proposer: this.id,
                 timestamp: Date.now(),
                 transactionsRoot: createHash('sha256')
                     .update(JSON.stringify(transactions))
                     .digest('hex'),
-                stateRoot: newState.stateRoot
+                stateRoot: ephemeralState.stateRoot
             };
 
-            // Create block
             const block: Block = {
                 header,
                 transactions,
                 signatures: Map()
             };
 
-            // Update state
-            this._state = newState;
+            // Commit ephemeral changes
+            this._state = ephemeralState;
             this._version += 1;
             this._blocks.push(block);
 
             return right(block);
         } catch (error) {
-            return left(createMachineError(
-                'INTERNAL_ERROR',
-                'Failed to produce block',
-                error
-            ));
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to produce block', error));
         }
     }
 
     async receiveBlock(block: Block): Promise<Either<MachineError, void>> {
         try {
-            // Verify block links to our chain
             if (block.header.prevHash !== this._state.latestHash) {
-                return left(createMachineError(
-                    'VALIDATION_ERROR',
-                    'Block does not link to current chain'
-                ));
+                return left(createMachineError('VALIDATION_ERROR', 'Block does not link to current chain'));
             }
 
-            // Verify block
             const verifyResult = await this.verifyBlock(block);
             if (verifyResult._tag === 'Left') {
                 return verifyResult;
             }
             if (!verifyResult.right) {
-                return left(createMachineError(
-                    'VALIDATION_ERROR',
-                    'Block verification failed'
-                ));
+                return left(createMachineError('VALIDATION_ERROR', 'Block verification failed'));
             }
 
-            // Apply transactions to create new state
-            let newState = { ...this._state };
+            // Apply transactions to a local ephemeral state
+            let ephemeralState = { ...this._state };
             for (const tx of block.transactions) {
-                const result = await this.handleEvent(tx);
+                const result = await this.handleEventLocal(ephemeralState, tx);
                 if (result._tag === 'Left') {
-                    return result;
+                    return result; // If any fails, we abort
                 }
+                ephemeralState = result.right;
             }
 
-            // Update state
-            newState.blockHeight = block.header.height;
-            newState.latestHash = createHash('sha256')
+            ephemeralState.blockHeight = block.header.height;
+            ephemeralState.latestHash = createHash('sha256')
                 .update(JSON.stringify(block))
                 .digest('hex');
-            newState.stateRoot = block.header.stateRoot;
+            ephemeralState.stateRoot = block.header.stateRoot;
 
-            // Verify state transition
-            const transitionResult = this.verifyStateTransition(this._state, newState);
+            const transitionResult = this.verifyStateTransition(this._state, ephemeralState);
             if (transitionResult._tag === 'Left') {
                 return transitionResult;
             }
             if (!transitionResult.right) {
-                return left(createMachineError(
-                    'VALIDATION_ERROR',
-                    'State transition verification failed'
-                ));
+                return left(createMachineError('VALIDATION_ERROR', 'State transition verification failed'));
             }
 
-            // Update machine state
-            this._state = newState;
+            // Commit ephemeral changes
+            this._state = ephemeralState;
             this._version += 1;
             this._blocks.push(block);
 
             return right(undefined);
         } catch (error) {
-            return left(createMachineError(
-                'INTERNAL_ERROR',
-                'Failed to receive block',
-                error
-            ));
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to receive block', error));
         }
     }
 
     async verifyBlock(block: Block): Promise<Either<MachineError, boolean>> {
         try {
-            // Verify block structure
             if (!block.header || !block.transactions) {
                 return right(false);
             }
-
-            // Verify block links correctly
             if (block.header.height !== this._state.blockHeight + 1) {
                 return right(false);
             }
 
-            // Verify transactions root
             const txRoot = createHash('sha256')
                 .update(JSON.stringify(block.transactions))
                 .digest('hex');
@@ -234,62 +217,58 @@ export abstract class AbstractBaseMachine implements BaseMachine {
                 return right(false);
             }
 
-            // Verify state root matches
+            // Ephemeral state check
             let tempState = { ...this._state };
             for (const tx of block.transactions) {
-                const result = await this.handleEvent(tx);
+                const result = await this.handleEventLocal(tempState, tx);
                 if (result._tag === 'Left') {
                     return right(false);
                 }
+                tempState = result.right;
             }
 
-            const stateRootResult = this.computeStateRoot();
+            const stateRootResult = this.computeStateRootFrom(tempState);
             if (stateRootResult._tag === 'Left') {
                 return stateRootResult;
             }
-
             return right(stateRootResult.right === block.header.stateRoot);
         } catch (error) {
-            return left(createMachineError(
-                'INTERNAL_ERROR',
-                'Failed to verify block',
-                error
-            ));
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to verify block', error));
         }
     }
 
     async reconstructState(targetHash: string): Promise<Either<MachineError, BaseMachineState>> {
         try {
-            // Find block with target hash
-            const targetBlock = this._blocks.find(b => 
-                createHash('sha256')
-                    .update(JSON.stringify(b))
-                    .digest('hex') === targetHash
+            const targetBlock = this._blocks.find(b =>
+                createHash('sha256').update(JSON.stringify(b)).digest('hex') === targetHash
             );
-
             if (!targetBlock) {
-                return left(createMachineError(
-                    'VALIDATION_ERROR',
-                    'Target block not found'
-                ));
+                return left(createMachineError('VALIDATION_ERROR', 'Target block not found'));
             }
 
-            // Replay all transactions up to target block
-            let state = { ...this._state };
+            // Replay all transactions up to target block on an ephemeral state
+            let ephemeralState = { ...this._state };
             for (const tx of targetBlock.transactions) {
-                const result = await this.handleEvent(tx);
+                const result = await this.handleEventLocal(ephemeralState, tx);
                 if (result._tag === 'Left') {
                     return result;
                 }
+                ephemeralState = result.right;
             }
 
-            return right(state);
+            return right(ephemeralState);
         } catch (error) {
-            return left(createMachineError(
-                'INTERNAL_ERROR',
-                'Failed to reconstruct state',
-                error
-            ));
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to reconstruct state', error));
+        }
+    }
+
+    // New helper to compute a state root from any ephemeral state, rather than from this._state
+    private computeStateRootFrom(state: BaseMachineState): Either<MachineError, string> {
+        try {
+            const hashValue = createHash('sha256').update(JSON.stringify(state)).digest('hex');
+            return right(hashValue);
+        } catch (error) {
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to compute state root', error));
         }
     }
 

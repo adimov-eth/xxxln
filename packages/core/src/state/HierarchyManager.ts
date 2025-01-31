@@ -20,9 +20,9 @@ export function createEntityForSigner(
   config: EntityConfig,
   entityMachineFactory: (id: MachineId, parentId: MachineId, config: EntityConfig) => Either<MachineError, EntityMachine>
 ): Either<MachineError, EntityMachine> {
-  // Generate a deterministic entity ID based on signer and config
+  // Generate a deterministic entity ID based solely on signer and config
   const entityId = createHash('sha256')
-    .update(`${signer.id}_${JSON.stringify(config)}_${Date.now()}`)
+    .update(`${signer.id}_${JSON.stringify(config)}`)
     .digest('hex')
     .slice(0, 16);
 

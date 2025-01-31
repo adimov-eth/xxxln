@@ -1,4 +1,5 @@
 import { Map } from 'immutable';
+import { Command, Query, Response, Event as MessageEvent } from './Messages';
 
 // Basic types
 export type MachineId = string;
@@ -16,6 +17,7 @@ export interface Machine {
 export type ErrorCode = 
   | 'INTERNAL_ERROR'
   | 'INVALID_STATE'
+  | 'INVALID_HASH'
   | 'INVALID_SIGNATURE'
   | 'INVALID_PROPOSAL'
   | 'UNAUTHORIZED'
@@ -69,7 +71,10 @@ export interface Message<T = unknown> {
   readonly causationId?: string;
 }
 
-// Event types
+// Machine Event type that combines all possible message types
+export type MachineEvent = Message<Command | MessageEvent | Query | Response<unknown>>;
+
+// Event types for internal use
 export interface Event {
   readonly id: string;
   readonly type: string;

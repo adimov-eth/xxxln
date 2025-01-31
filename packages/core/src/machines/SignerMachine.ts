@@ -29,7 +29,7 @@ export const createSignerState = (
     latestHash: '',
     stateRoot: '',
     data: Map(),
-    nonces: Map(),
+    nonces: Map([[publicKey, 0]]),
     parentId,
     childIds: [],
     publicKey,
@@ -53,6 +53,19 @@ export class SignerMachineImpl extends AbstractBaseMachine {
         const initialState = createSignerState(publicKeyResult.right, parentId);
         super(id, 'SIGNER', eventBus, initialState);
         this._signerState = initialState;
+    }
+
+    public async handleEventLocal(
+        ephemeralState: BaseMachineState,
+        event: Message<unknown>
+    ): Promise<Either<MachineError, BaseMachineState>> {
+        // Forward to handleEvent
+        const result = await this.handleEvent(event);
+        if (result._tag === 'Left') {
+            return left(result.left);
+        }
+        // If no error, return the unchanged ephemeral state
+        return right(ephemeralState);
     }
 
     protected async processSignerCommand(message: Message<SignerCommand>): Promise<Either<MachineError, void>> {
@@ -150,7 +163,7 @@ export class SignerMachineImpl extends AbstractBaseMachine {
 }
 
 // Helper function to compute transaction hash
-const computeTransactionHash = (transaction: SignedTransaction): Uint8Array => {
+const computeTransactionHash = (transaction: SignedTransaction): Buffer => {
     const hash = createHash('sha256')
         .update(JSON.stringify({
             nonce: transaction.nonce,
@@ -160,7 +173,7 @@ const computeTransactionHash = (transaction: SignedTransaction): Uint8Array => {
         }))
         .digest();
         
-    return new Uint8Array(hash);
+    return hash;
 };
 
 // State validation

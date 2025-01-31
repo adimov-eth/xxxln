@@ -1,35 +1,25 @@
-import { ServerCommand } from '@xxxln/core';
 import { 
+  ServerCommand,
   NetworkManager,
   NodeInfo,
   NetworkMessage,
   NetworkBlock,
   CentralEventBus,
-  Block,
   BlockHeader,
   MachineId,
   Message,
-  BlockData,
-  PublicKey,
-  SignatureData,
-  getKeyStorage,
-  KeyStorage,
-  createEcdsaSignature,
-  verifyEcdsaSignature,
   MachineError,
   createMachineError,
-  derivePublicKey,
   createNodeManagers,
   initializeNodeNetwork,
   stopNodeNetwork,
   subscribeToNodeEvents,
   runBlockProductionLoop,
   NodeHealth,
-  LogLevel,
   createMempoolState,
-  MempoolEntry
-} from '@xxxln/core';
-import {
+  MempoolEntry,
+  BlockType as Block,
+  CoreEvent,
   Transaction,
   TransactionType
 } from '@xxxln/core';
@@ -44,6 +34,15 @@ import { config } from 'dotenv';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
+import { KeyStorage } from '@xxxln/core';
+
+// Define LogLevel locally
+enum LogLevel {
+  DEBUG = 'DEBUG',
+  INFO = 'INFO',
+  WARN = 'WARN',
+  ERROR = 'ERROR'
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -199,8 +198,8 @@ const createBlock = (
   }));
 
   const header: BlockHeader = {
-    blockNumber: height,
-    parentHash,
+    height: height,
+    prevHash: parentHash,
     proposer: proposerId,
     timestamp: Date.now(),
     transactionsRoot: computeTransactionsRoot(transactions),
@@ -221,17 +220,17 @@ const createBlock = (
    4) SIMULATION MAIN
 ------------------------------ */
 async function main(): Promise<void> {
-  const eventBus = new CentralEventBus();
-  const nodeHealthMap = new Map<string, NodeHealth>();
-
-  // Initialize KeyStorage with node private keys
-  const initialKeys = new Map(
+  // Initialize key storage first
+  const keyStore = new Map(
     NODES_CONFIG.map(node => [
       node.id,
-      node.privateKey
+      node.privateKey || 'test_key'
     ])
   );
-  KeyStorage.initialize(initialKeys);
+  KeyStorage.initialize(keyStore);
+
+  const eventBus = new CentralEventBus();
+  const nodeHealthMap = new Map<string, NodeHealth>();
 
   // Initialize dashboard server
   const dashboardServer = createDashboardServer(3100);
@@ -379,7 +378,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      logger.info(`[${nodeId}] New block produced: #${blockData.header.blockNumber}`, undefined, {
+      logger.info(`[${nodeId}] New block produced: #${blockData.header.height}`, undefined, {
         hash: block.hash,
         transactions: blockData.transactions.length,
         proposer: blockData.header.proposer,
@@ -419,7 +418,7 @@ async function main(): Promise<void> {
       // Update block info
       blockchainState = {
         ...blockchainState,
-        height: blockData.header.blockNumber,
+        height: blockData.header.height,
         tipHash: block.hash
       };
 

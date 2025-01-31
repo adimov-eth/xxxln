@@ -4,8 +4,8 @@ import { pipe, flow } from 'fp-ts/function';
 import { createHash } from 'crypto';
 import { TaskEither, tryCatch } from 'fp-ts/TaskEither';
 
-import { MachineError, Message, createMachineError, MachineId, Hash } from '../types/Core';
-import { EntityCommand, Event } from '../types/Messages';
+import { MachineError, Message, createMachineError, MachineId, Hash, MachineEvent } from '../types/Core';
+import { EntityCommand, Event as MessageEvent } from '../types/Messages';
 import { Proposal, ProposalId, ProposalStatus } from '../types/ProposalTypes';
 import { AbstractBaseMachine, BaseMachineState } from './BaseMachine';
 import { EventBus } from '../eventbus/EventBus';
@@ -116,10 +116,17 @@ export class EntityMachineImpl extends AbstractBaseMachine {
                     this._state = this._entityState;
                     this._version += 1;
 
-                    const outEvent: Event = {
+                    const outEvent: MachineEvent = {
+                        id: `evt_${Date.now()}`,
                         type: 'PROPOSAL_CREATED',
-                        proposalId: proposal.id,
-                        proposer: message.sender
+                        payload: {
+                            type: 'PROPOSAL_CREATED',
+                            proposalId: proposal.id,
+                            proposer: message.sender
+                        },
+                        timestamp: Date.now(),
+                        sender: this.id,
+                        recipient: 'ALL'
                     };
                     this.eventBus.dispatch(outEvent);
                     return right(undefined);
@@ -146,19 +153,27 @@ export class EntityMachineImpl extends AbstractBaseMachine {
                         if (isLeft(executeResult)) {
                             return executeResult;
                         }
+                    } else {
+                        // Only update the proposal in-state if threshold is not met
+                        this._entityState = {
+                            ...this._entityState,
+                            proposals: this._entityState.proposals.set(updatedProposal.id, updatedProposal)
+                        };
+                        this._state = this._entityState;
+                        this._version += 1;
                     }
 
-                    this._entityState = {
-                        ...this._entityState,
-                        proposals: this._entityState.proposals.set(proposal.id, updatedProposal)
-                    };
-                    this._state = this._entityState;
-                    this._version += 1;
-
-                    const outEvent: Event = {
+                    const outEvent: MachineEvent = {
+                        id: `evt_${Date.now()}`,
                         type: 'PROPOSAL_APPROVED',
-                        proposalId: message.payload.proposalId,
-                        approver: message.sender
+                        payload: {
+                            type: 'PROPOSAL_APPROVED',
+                            proposalId: message.payload.proposalId,
+                            approver: message.sender
+                        },
+                        timestamp: Date.now(),
+                        sender: this.id,
+                        recipient: 'ALL'
                     };
                     this.eventBus.dispatch(outEvent);
                     return right(undefined);
@@ -258,9 +273,16 @@ export class EntityMachineImpl extends AbstractBaseMachine {
             this._state = this._entityState;
             this._version += 1;
 
-            const outEvent: Event = {
+            const outEvent: MachineEvent = {
+                id: `evt_${Date.now()}`,
                 type: 'PROPOSAL_EXECUTED',
-                proposalId: proposal.id
+                payload: {
+                    type: 'PROPOSAL_EXECUTED',
+                    proposalId: proposal.id
+                },
+                timestamp: Date.now(),
+                sender: this.id,
+                recipient: 'ALL'
             };
             this.eventBus.dispatch(outEvent);
 
@@ -268,6 +290,18 @@ export class EntityMachineImpl extends AbstractBaseMachine {
         } catch (error) {
             return left(createMachineError('INTERNAL_ERROR', 'Failed to execute proposal', error));
         }
+    }
+
+    public async handleEventLocal(
+        ephemeralState: BaseMachineState,
+        event: Message<unknown>
+    ): Promise<Either<MachineError, BaseMachineState>> {
+        const result = await this.handleEvent(event);
+        if (result._tag === 'Left') {
+            return left(result.left);
+        }
+        // If handleEvent succeeded, return the unchanged ephemeral state
+        return right(ephemeralState);
     }
 }
 
@@ -383,438 +417,24 @@ const validateEntityState = (state: EntityStateData): Either<MachineError, void>
   }
 };
 
-// Command processing
-export const processCommand = async (
+// Command execution
+const executeCommand = async (
   machine: EntityMachine,
   message: Message<EntityCommand>
 ): Promise<Either<MachineError, EntityMachine>> => {
-  const validationResult = await validateCommand(machine, message);
-  if (isLeft(validationResult)) {
-    return validationResult as Either<MachineError, EntityMachine>;
-  }
-  return executeCommand(machine, message);
-};
-
-// Command validation
-const validateCommand = async (
-  machine: EntityMachine,
-  message: Message<EntityCommand>
-): Promise<Either<MachineError, void>> => {
   try {
-    switch (message.payload.type) {
-      case 'PROPOSE_TRANSACTION':
-        return await validateProposedTransaction(machine, message.payload.transaction);
-        
-      case 'UPDATE_CONFIG':
-        return validateConfigUpdate(machine, message.payload.newConfig);
-        
-      case 'OPEN_CHANNEL':
-        return validateChannelOperation(machine, message.payload.partnerId);
-        
-      case 'CLOSE_CHANNEL':
-        return validateChannelClosure(machine, message.payload.channelId);
-        
-      default:
-        return right(undefined);
-    }
-  } catch (error) {
-    return left(createMachineError(
-      'VALIDATION_ERROR',
-      'Failed to validate command',
-      error
-    ));
-  }
-};
-
-// Transaction validation
-const validateProposedTransaction = async (
-  machine: EntityMachine,
-  transaction: SignedTransaction
-): Promise<Either<MachineError, void>> => {
-  const data = machine.state.get('data');
-  if (!data || typeof data !== 'object') {
-    return left(createMachineError(
-      'INVALID_STATE',
-      'Entity state must contain data object'
-    ));
-  }
-
-  const { config, nonce } = data as {
-    config: EntityConfig;
-    nonce: number;
-  };
-
-  // Check nonce
-  if (transaction.nonce <= nonce) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction nonce must be greater than current nonce'
-    ));
-  }
-
-  // Verify signatures meet threshold
-  const messageHash = computeTransactionHash(transaction);
-  let totalWeight = 0;
-  const errors = Map<string, MachineError>().asMutable();
-
-  // Verify each signature
-  for (const [signer, weight] of config.signers) {
-    const signature = transaction.partialSignatures.get(signer);
-    if (!signature) {
-      errors.set(signer, createMachineError(
-        'INVALID_OPERATION',
-        'Missing signature from signer'
-      ));
-      continue;
+    if (!(machine instanceof EntityMachineImpl)) {
+      return left(createMachineError('INVALID_STATE', 'Machine must be an EntityMachineImpl instance'));
     }
 
-    const result = await verifyEcdsaSignature(messageHash, signature, signer);
+    const entityMachine = machine as EntityMachineImpl;
+    const result = await entityMachine.handleEvent(message);
+    
     if (isLeft(result)) {
-      errors.set(signer, result.left);
-    } else if (result.right) {
-      totalWeight += weight;
-    } else {
-      errors.set(signer, createMachineError(
-        'INVALID_OPERATION',
-        'Invalid signature'
-      ));
+      return result as Either<MachineError, EntityMachine>;
     }
-  }
-
-  if (totalWeight < config.threshold) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Insufficient valid signatures',
-      { 
-        totalWeight,
-        threshold: config.threshold,
-        errors: errors.asImmutable()
-      }
-    ));
-  }
-
-  return right(undefined);
-};
-
-// Config update validation
-const validateConfigUpdate = (
-  machine: EntityMachine,
-  newConfig: EntityConfig
-): Either<MachineError, void> => {
-  // Validate new config structure
-  if (newConfig.threshold <= 0) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'New threshold must be positive'
-    ));
-  }
-
-  if (newConfig.signers.size === 0) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'New config must have at least one signer'
-    ));
-  }
-
-  // Validate weights
-  const hasInvalidWeight = Array.from(newConfig.signers.values()).some(weight => weight <= 0);
-  if (hasInvalidWeight) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'All signer weights must be positive'
-    ));
-  }
-
-  // Calculate total weight
-  const totalWeight = Array.from(newConfig.signers.values()).reduce((sum, weight) => sum + weight, 0);
-
-  // Validate threshold against total weight
-  if (newConfig.threshold > totalWeight) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Threshold cannot be greater than total weight'
-    ));
-  }
-
-  return right(undefined);
-};
-
-// Channel operation validation
-const validateChannelOperation = (
-  machine: EntityMachine,
-  partnerId: string
-): Either<MachineError, void> => {
-  const data = machine.state.get('data');
-  if (!data || typeof data !== 'object') {
-    return left(createMachineError(
-      'INVALID_STATE',
-      'Entity state must contain data object'
-    ));
-  }
-
-  const { channels } = data as {
-    channels: Map<string, Hash>;
-  };
-
-  // Check if channel already exists
-  if (channels.has(partnerId)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Channel already exists with this partner'
-    ));
-  }
-
-  // In practice, would also validate:
-  // - Partner entity exists
-  // - Partner entity accepts channel
-  // - Channel limits and parameters
-  
-  return right(undefined);
-};
-
-// Channel state types
-type ChannelStatus = 'ACTIVE' | 'SETTLING' | 'DISPUTED' | 'CLOSED';
-
-type ChannelState = {
-  readonly status: ChannelStatus;
-  readonly balance: bigint;
-  readonly lastUpdateNonce: number;
-  readonly disputeTimeout?: number;
-  readonly settlementProposal?: {
-    readonly proposer: string;
-    readonly balances: Map<string, bigint>;
-    readonly signatures: Map<string, string>;
-    readonly timestamp: number;
-  };
-};
-
-// Channel closure validation
-const validateChannelClosure = (
-  machine: EntityMachine,
-  channelId: string
-): Either<MachineError, void> => {
-  const data = machine.state.get('data');
-  if (!data || typeof data !== 'object') {
-    return left(createMachineError(
-      'INVALID_STATE',
-      'Entity state must contain data object'
-    ));
-  }
-
-  const { channels, config } = data as {
-    channels: Map<string, Hash>;
-    config: EntityConfig;
-  };
-
-  // Check if channel exists
-  if (!channels.has(channelId)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Channel does not exist'
-    ));
-  }
-
-  // Get channel state and validate
-  return pipe(
-    getChannelState(channelId),
-    chain(state => {
-      // Check channel status
-      if (state.status === 'CLOSED') {
-        return left(createMachineError(
-          'INVALID_OPERATION',
-          'Channel is already closed'
-        ));
-      }
-
-      if (state.status === 'DISPUTED') {
-        // Check if dispute timeout has passed
-        const now = Date.now();
-        if (state.disputeTimeout && now < state.disputeTimeout) {
-          return left(createMachineError(
-            'INVALID_OPERATION',
-            'Cannot close channel during active dispute',
-            { 
-              timeRemaining: state.disputeTimeout - now 
-            }
-          ));
-        }
-      }
-
-      // Check settlement status
-      if (state.status === 'SETTLING') {
-        if (!state.settlementProposal) {
-          return left(createMachineError(
-            'INVALID_STATE',
-            'Channel in SETTLING state but no settlement proposal found'
-          ));
-        }
-
-        // Verify settlement signatures
-        return pipe(
-          verifySettlementSignatures(state.settlementProposal, config),
-          chain(result => {
-            if (!result.isValid) {
-              return left(createMachineError(
-                'INVALID_OPERATION',
-                'Insufficient valid signatures for settlement',
-                { 
-                  totalWeight: result.totalWeight,
-                  threshold: config.threshold,
-                  errors: result.errors
-                }
-              ));
-            }
-
-            // Verify balances match current state
-            if (!verifySettlementBalances((state.settlementProposal as NonNullable<typeof state.settlementProposal>).balances, state.balance)) {
-              return left(createMachineError(
-                'INVALID_OPERATION',
-                'Settlement balances do not match channel state'
-              ));
-            }
-
-            return right(undefined);
-          })
-        );
-      }
-
-      // For ACTIVE channels, require settlement proposal
-      if (state.status === 'ACTIVE') {
-        return left(createMachineError(
-          'INVALID_OPERATION',
-          'Cannot close active channel without settlement proposal'
-        ));
-      }
-
-      return right(undefined);
-    })
-  );
-};
-
-// Helper functions for channel validation
-const getChannelState = (channelId: string): Either<MachineError, ChannelState> => {
-  try {
-    // In practice, would fetch from storage/network
-    // Mock implementation for now
-    return right({
-      status: 'ACTIVE',
-      balance: BigInt(0),
-      lastUpdateNonce: 0
-    });
-  } catch (error) {
-    return left(createMachineError(
-      'INTERNAL_ERROR',
-      'Failed to fetch channel state',
-      error
-    ));
-  }
-};
-
-const verifySettlementSignatures = (
-  settlement: NonNullable<ChannelState['settlementProposal']>,
-  config: EntityConfig
-): Either<MachineError, { 
-  readonly isValid: boolean;
-  readonly totalWeight: number;
-  readonly errors: Map<string, MachineError>;
-}> => {
-  try {
-    // Create settlement message
-    const message = createSettlementMessage(settlement);
-
-    // Verify each signature
-    let totalWeight = 0;
-    const errors = Map<string, MachineError>().asMutable();
-
-    for (const [signer, weight] of config.signers) {
-      const signature = settlement.signatures.get(signer);
-      if (!signature) {
-        errors.set(signer, createMachineError(
-          'INVALID_OPERATION',
-          'Missing signature from signer'
-        ));
-        continue;
-      }
-
-      if (verifySignature(message, signature, signer)) {
-        totalWeight += weight;
-      } else {
-        errors.set(signer, createMachineError(
-          'INVALID_OPERATION',
-          'Invalid signature'
-        ));
-      }
-    }
-
-    return right({
-      isValid: totalWeight >= config.threshold,
-      totalWeight,
-      errors: errors.asImmutable()
-    });
-  } catch (error) {
-    return left(createMachineError(
-      'INTERNAL_ERROR',
-      'Failed to verify settlement signatures',
-      error
-    ));
-  }
-};
-
-const verifySettlementBalances = (
-  proposedBalances: Map<string, bigint>,
-  currentBalance: bigint
-): boolean => {
-  // Sum all proposed balances
-  const totalProposed = Array.from(proposedBalances.values())
-    .reduce((sum, balance) => sum + balance, BigInt(0));
-
-  // Verify total matches current balance
-  return totalProposed === currentBalance;
-};
-
-const createSettlementMessage = (
-  settlement: NonNullable<ChannelState['settlementProposal']>
-): string => {
-  const data = {
-    proposer: settlement.proposer,
-    balances: Array.from(settlement.balances.entries())
-      .sort(([a], [b]) => a.localeCompare(b)),
-    timestamp: settlement.timestamp
-  };
-  return JSON.stringify(data);
-};
-
-const verifySignature = (
-  message: string,
-  signature: string,
-  publicKey: string
-): Either<MachineError, boolean> => {
-  try {
-    const messageBuffer = Buffer.from(message, 'utf8');
-    return verifyEcdsaSignature(messageBuffer, signature, publicKey);
-  } catch (error) {
-    return left(createMachineError(
-      'INTERNAL_ERROR',
-      'Failed to verify signature',
-      error
-    ));
-  }
-};
-
-// Command execution
-const executeCommand = (
-  machine: EntityMachine,
-  message: Message<EntityCommand>
-): Either<MachineError, EntityMachine> => {
-  try {
-    return pipe(
-      processEntityCommand(machine.state, message),
-      map(newState => ({
-        ...machine,
-        state: newState,
-        version: machine.version + 1
-      }))
-    );
+    
+    return right(machine);
   } catch (error) {
     return left(createMachineError(
       'INTERNAL_ERROR',
@@ -1023,7 +643,7 @@ const computeInitialChannelHash = (partnerId: string): BlockHash => {
 };
 
 // Event generation
-export const generateTransactionEvent = (transaction: Transaction): Event => ({
+export const generateTransactionEvent = (transaction: Transaction): MessageEvent => ({
   type: 'STATE_UPDATED',
   machineId: transaction.sender,
   version: 1,
@@ -1035,7 +655,7 @@ export const generateChannelEvent = (
   partnerId: string,
   isOpening: boolean = true,
   finalBalances?: Map<MachineId, bigint>
-): Event => 
+): MessageEvent => 
   isOpening 
     ? { type: 'CHANNEL_OPENED' as const, channelId }
     : { 

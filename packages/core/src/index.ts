@@ -10,17 +10,58 @@ export type {
 export * from './eventbus/EventBus';
 
 // Type exports
-export * from './types/BlockTypes';
-export * from './types/Core';
-export * from './types/Messages';
-export * from './types/MachineTypes';
-export type { 
-  PublicKey,
-  SignatureData,
+export {
+    // From BlockTypes
+    type Block as BlockType,
+    type BlockHeader,
+    type MempoolEntry,
+    type MempoolState,
+    type BlockProductionConfig,
+    type BlockValidationResult,
+    type BlockStore,
+    createMempoolState,
+    createBlockProductionConfig
 } from './types/BlockTypes';
-export type { MachineError } from './types/Core';
-export { createMachineError } from './types/Core';
-export { LogLevel } from './types/Core';
+
+export {
+    // From Core
+    type MachineId,
+    type Hash,
+    type Machine,
+    type MachineError,
+    type State,
+    type Message,
+    type MachineEvent,
+    type Block as CoreBlock,
+    type Event as CoreEvent,
+    createMachineError
+} from './types/Core';
+
+export {
+    // From Messages
+    type MessageKind,
+    type ServerCommand,
+    type SignerCommand,
+    type EntityCommand,
+    type ChannelCommand,
+    type Command,
+    type Event as MessageEvent,
+    type Query,
+    type Response,
+    type ValidationResult,
+    type Route
+} from './types/Messages';
+
+export {
+    // From MachineTypes
+    type Transaction,
+    type TransactionType,
+    type SignedTransaction,
+    type EntityConfig,
+    type EntityMachine,
+    type EntityState,
+    type EntityStateData
+} from './types/MachineTypes';
 
 // Crypto exports
 export { KeyStorage, getKeyStorage } from './crypto/KeyStorage';

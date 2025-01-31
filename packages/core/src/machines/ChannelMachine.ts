@@ -122,24 +122,36 @@ const verifyStateUpdate = (
     ));
   }
 
-  // Verify signatures
-  for (const [signer, signature] of update.signatures) {
-    if (!data.participants.includes(signer)) {
+  // 1) Restore hash checking
+  const computedHash = computeStateHash(update);
+  if (computedHash !== update.stateHash) {
+    return left(createMachineError(
+      'INVALID_HASH',
+      'Computed hash does not match the provided stateHash'
+    ));
+  }
+
+  // 2) Require all participants' signatures, not just checking signers are participants
+  for (const participant of data.participants) {
+    const signature = update.signatures.get(participant);
+
+    if (!signature) {
       return left(createMachineError(
         'INVALID_SIGNATURE',
-        'Signature from non-participant'
+        `Missing signature from participant: ${participant}`
       ));
     }
 
     const verifyResult = verifyEcdsaSignature(
-      Buffer.from(computeStateHash(update), 'hex'),
+      Buffer.from(computedHash, 'hex'),
       signature,
-      signer
+      participant
     );
+
     if (verifyResult._tag === 'Left' || !verifyResult.right) {
       return left(createMachineError(
         'INVALID_SIGNATURE',
-        'Invalid signature'
+        `Invalid signature from participant: ${participant}`
       ));
     }
   }
@@ -151,8 +163,7 @@ const computeStateHash = (update: StateUpdate): string => {
   const hash = createHash('sha256')
     .update(JSON.stringify({
       sequence: update.sequence,
-      balances: update.balances.toJS(),
-      timestamp: update.timestamp
+      balances: update.balances.toJS()
     }))
     .digest('hex');
   
@@ -508,22 +519,85 @@ const processChannelCommand = (
     }
       
     case 'RESOLVE_DISPUTE': {
-      if (!data.currentDispute || !message.payload.evidence) {
+      // Prevent resolution if dispute doesn't exist:
+      if (!data.currentDispute) {
         return state;
       }
 
-      const updatedDispute: DisputeState = {
-        initiator: data.currentDispute.initiator,
-        contestedUpdate: data.currentDispute.contestedUpdate,
-        startTime: data.currentDispute.startTime,
+      // If no new evidence is provided, do nothing:
+      if (!message.payload.evidence) {
+        return state;
+      }
+
+      // 1) Collect or update evidence from this participant.
+      //    We'll store participant evidence in a new Map,
+      //    so we can verify each participant's submission.
+      const now = Date.now();
+      const participantEvidenceMap = (data.currentDispute as any).participantEvidenceMap
+        ? (data.currentDispute as any).participantEvidenceMap
+        : Map<MachineId, { stateUpdate: SignedStateUpdate; timestamp: number }>();
+
+      const updatedEvidenceMap = participantEvidenceMap.set(
+        message.sender,
+        {
+          stateUpdate: message.payload.evidence,
+          timestamp: now
+        }
+      );
+
+      // 2) Check if all participants have submitted evidence
+      const allEvidenceSubmitted = data.participants.every(
+        participant => updatedEvidenceMap.has(participant)
+      );
+
+      if (!allEvidenceSubmitted) {
+        // If not all have submitted, store partial evidence but do not resolve yet
+        const partialDispute = {
+          ...data.currentDispute,
+          resolved: false,
+          // Keep the existing contestedUpdate for reference
+          // Store new Map in participantEvidenceMap
+          participantEvidenceMap: updatedEvidenceMap
+        };
+
+        return state.set('data', {
+          ...data,
+          currentDispute: partialDispute,
+          sequence: data.sequence + 1
+        });
+      }
+
+      // 3) If all participants have submitted, choose the latest valid state update
+      const evidenceArray = Array.from(
+        updatedEvidenceMap.values()
+      ) as Array<{ stateUpdate: SignedStateUpdate; timestamp: number }>;
+
+      const updates = evidenceArray
+        .map(e => e.stateUpdate)
+        .sort((a, b) => b.sequence - a.sequence);
+
+      const latestUpdate = updates[0];
+      if (!latestUpdate) {
+        return state;
+      }
+
+      // 4) Mark dispute as resolved and apply the latest valid update
+      const resolvedDispute = {
+        ...data.currentDispute,
         resolved: true,
-        evidence: message.payload.evidence
+        participantEvidenceMap: updatedEvidenceMap
       };
 
       return state.set('data', {
         ...data,
-        currentDispute: updatedDispute,
-        sequence: data.sequence + 1
+        currentDispute: resolvedDispute,
+        balances: latestUpdate.balances,
+        sequence: latestUpdate.sequence,
+        stateUpdates: data.stateUpdates.set(latestUpdate.sequence, {
+          ...latestUpdate,
+          stateHash: computeStateHash(latestUpdate),
+          signatures: Map()
+        })
       });
     }
 
@@ -587,6 +661,10 @@ const processDisputeTimeout = (
 
   // Check if dispute period has elapsed
   if (currentTime >= data.currentDispute.startTime + data.disputePeriod) {
+    // Reintroduce penalty logic
+    const penalties = computeDisputePenalties(data);
+    const newBalances = applyPenalties(data.balances, penalties);
+
     const updatedDispute: DisputeState = {
       initiator: data.currentDispute.initiator,
       contestedUpdate: data.currentDispute.contestedUpdate,
@@ -597,7 +675,8 @@ const processDisputeTimeout = (
 
     return right({
       ...data,
-      currentDispute: updatedDispute
+      currentDispute: updatedDispute,
+      balances: newBalances
     });
   }
 
@@ -609,12 +688,19 @@ const computeDisputePenalties = (data: ChannelData): Map<MachineId, bigint> => {
     return Map();
   }
 
+  // If we have no participant evidence map, we can't identify who was non-responsive
+  const participantEvidenceMap = (data.currentDispute as any).participantEvidenceMap;
+  if (!participantEvidenceMap) {
+    return Map();
+  }
+
+  // Penalize only those who haven't submitted evidence
   const penalties = Map<MachineId, bigint>().asMutable();
-  
-  // Calculate penalties for each participant based on their balances
   for (const participant of data.participants) {
-    const currentBalance = data.balances.get(participant) || BigInt(0);
-    penalties.set(participant, currentBalance / BigInt(10)); // 10% penalty
+    if (!participantEvidenceMap.has(participant)) {
+      const currentBalance = data.balances.get(participant) || BigInt(0);
+      penalties.set(participant, currentBalance / BigInt(10)); // 10% penalty
+    }
   }
 
   return penalties.asImmutable();

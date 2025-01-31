@@ -38,9 +38,9 @@ export class CentralEventBus implements EventBus {
   }
 
   dispatch(event: MachineEvent): void {
-    // If target specified, deliver to that machine's inbox
-    if (event.target && this.machines.has(event.target)) {
-      const targetMachine = this.machines.get(event.target)!;
+    // If recipient specified, deliver to that machine's inbox
+    if (event.recipient && this.machines.has(event.recipient)) {
+      const targetMachine = this.machines.get(event.recipient)!;
       targetMachine.inbox.push(event);
     }
 

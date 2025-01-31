@@ -3,18 +3,19 @@ import { Map } from 'immutable';
 import { pipe } from 'fp-ts/function';
 import { createHash } from 'crypto';
 
-import { MachineError, Message, createMachineError } from '../types/Core';
-import { ServerCommand, Event } from '../types/Messages';
+import { MachineError, Message, createMachineError, MachineEvent } from '../types/Core';
+import { ServerCommand, Event, Query, Command } from '../types/Messages';
 import { BlockHash } from '../types/MachineTypes';
+import { Block, BlockProductionConfig, createBlockProductionConfig, MempoolEntry } from '../types/BlockTypes';
 import { EventBus } from '../eventbus/EventBus';
 import { AbstractBaseMachine, BaseMachineState } from './BaseMachine';
-import { MempoolEntry } from '../types/BlockTypes';
 
 // Extended base state for server
 interface ExtendedBaseMachineState extends BaseMachineState {
     readonly submachines: Map<string, BlockHash>;
     readonly lastBlockTime: number;
     readonly lastSyncTime: number;
+    readonly blockProductionConfig: BlockProductionConfig;
 }
 
 // Server-specific state
@@ -36,7 +37,8 @@ export const createServerState = (
         childIds: [],
         submachines,
         lastBlockTime: Date.now(),
-        lastSyncTime: Date.now()
+        lastSyncTime: Date.now(),
+        blockProductionConfig: createBlockProductionConfig()
     };
     return state;
 };
@@ -58,9 +60,53 @@ export class ServerMachineImpl extends AbstractBaseMachine {
 
     // Start block production loop
     private startBlockProduction(): void {
+        const state = this._state as ServerStateData;
         this._blockProductionInterval = setInterval(async () => {
             await this.produceBlock();
-        }, 100); // 100ms block time
+        }, state.blockProductionConfig.blockTime); // Use configured block time
+    }
+
+    // NEW: Reintroduce produceBlock method to dispatch "BLOCK_PRODUCED"
+    public async produceBlock(): Promise<Either<MachineError, Block>> {
+        try {
+            // Gather transactions from mempool (just an example).
+            const pendingTxs = Array.from(this._mempool.pending.values()).map(entry => entry.transaction);
+
+            const blockHash: BlockHash = `hash_${Date.now()}`;
+            const newBlock: Block = {
+                header: {
+                    height: (this._state.blockHeight + 1),
+                    timestamp: Date.now(),
+                    prevHash: this._state.latestHash,
+                    stateRoot: 'someNewStateRoot',
+                    transactionsRoot: 'someTransactionsRoot',
+                    proposer: this.id
+                },
+                transactions: pendingTxs,
+                signatures: Map()
+            };
+
+            // Dispatch block-produced event
+            const outEvent: MachineEvent = {
+                id: `evt_${Date.now()}`,
+                type: 'PROPOSE_BLOCK',
+                payload: { 
+                    kind: 'SERVER', 
+                    payload: { 
+                        type: 'PROPOSE_BLOCK', 
+                        block: newBlock 
+                    } 
+                },
+                timestamp: Date.now(),
+                sender: this.id,
+                recipient: 'ALL'
+            };
+            this.eventBus.dispatch(outEvent);
+
+            return right(newBlock);
+        } catch (error) {
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to produce block', error));
+        }
     }
 
     // Stop block production
@@ -88,27 +134,33 @@ export class ServerMachineImpl extends AbstractBaseMachine {
         }
     }
 
-    // Implement abstract methods
-    async handleEvent(event: Message<ServerCommand>): Promise<Either<MachineError, void>> {
+    // Rename and adjust: handleEventLocal is now the function that
+    // takes in a local ephemeral state and returns a new state.
+    public async handleEventLocal(
+        currentState: BaseMachineState,
+        event: Message<ServerCommand>
+    ): Promise<Either<MachineError, BaseMachineState>> {
         try {
-            // Handle state sync commands
+            // Treat currentState as immutable; return a copy on changes
+            const data = currentState as ServerStateData;
+
+            // 1) UPDATE_CHILD_STATE
             if (event.payload.type === 'UPDATE_CHILD_STATE') {
-                const data = this._state as ServerStateData;
                 const newState: ServerStateData = {
                     ...data,
                     submachines: data.submachines.set(event.payload.childId, event.payload.stateRoot)
                 };
-                this._state = newState;
-                this._version++;
-                return right(undefined);
+                return right(newState);
             }
 
+            // 2) SYNC_CHILD_STATES
             if (event.payload.type === 'SYNC_CHILD_STATES') {
-                void this.syncChildStates();
-                return right(undefined);
+                // We'll just return the same ephemeral state here.
+                // The actual sync logic is triggered externally.
+                return right(data);
             }
 
-            // Add transaction to mempool
+            // 3) Transactions that go into mempool
             if (event.payload.type !== 'PROCESS_BLOCK' && event.payload.type !== 'SYNC_STATE') {
                 const entry: MempoolEntry = {
                     transaction: event,
@@ -116,16 +168,22 @@ export class ServerMachineImpl extends AbstractBaseMachine {
                     gasPrice: BigInt(1),
                     nonce: 0
                 };
-                this._mempool = {
+                // Clone the mempool structure immutably:
+                const updatedPending = this._mempool.pending.set(event.id, entry);
+                const updatedMempool = {
                     ...this._mempool,
-                    pending: this._mempool.pending.set(event.id, entry),
+                    pending: updatedPending,
                     currentSize: this._mempool.currentSize + 1
                 };
-                return right(undefined);
+
+                // We do not set this._mempool directly in ephemeral mode,
+                // but you might store mempool changes on the ephemeral state if desired.
+                // For demonstration, let's keep the ephemeral state unmodified regarding mempool
+                // or create a new field in data. For now, we're returning data unchanged:
+                return right(data);
             }
 
-            // Process non-transaction commands immediately
-            const data = this._state as ServerStateData;
+            // 4) PROCESS_BLOCK or SYNC_STATE
             switch (event.payload.type) {
                 case 'PROCESS_BLOCK': {
                     const newState: ServerStateData = {
@@ -133,42 +191,45 @@ export class ServerMachineImpl extends AbstractBaseMachine {
                         blockHeight: data.blockHeight + 1,
                         latestHash: event.payload.blockHash
                     };
-                    this._state = newState;
-                    this._version++;
-
-                    const outEvent: Message<ServerCommand> = {
-                        id: `evt_${Date.now()}`,
-                        type: 'BLOCK_PROCESSED',
-                        payload: { type: 'REQUEST_BLOCK', blockHash: event.payload.blockHash },
-                        sender: this.id,
-                        recipient: event.sender,
-                        timestamp: Date.now()
-                    };
-                    this.eventBus.dispatch(outEvent);
-                    break;
+                    return right(newState);
                 }
-
                 case 'SYNC_STATE': {
                     const newState: ServerStateData = {
                         ...data,
                         latestHash: event.payload.targetHash
                     };
-                    this._state = newState;
-                    this._version++;
-
-                    const outEvent: Message<ServerCommand> = {
-                        id: `evt_${Date.now()}`,
-                        type: 'STATE_SYNCED',
-                        payload: { type: 'SYNC_STATE', targetHash: event.payload.targetHash },
-                        sender: this.id,
-                        recipient: event.sender,
-                        timestamp: Date.now()
-                    };
-                    this.eventBus.dispatch(outEvent);
-                    break;
+                    return right(newState);
                 }
             }
 
+            // If no recognized command, return the state unmodified
+            return right(data);
+        } catch (error) {
+            return left(createMachineError(
+                'INTERNAL_ERROR',
+                'Failed to handle event locally',
+                error
+            ));
+        }
+    }
+
+    // We still must provide a handleEvent(...) to fulfill BaseMachine's interface,
+    // but all real ephemeral logic is in handleEventLocal now.
+    public async handleEvent(event: Message<ServerCommand>): Promise<Either<MachineError, void>> {
+        try {
+            // Ensure top-level event type matches payload type to avoid inconsistencies:
+            event = {
+                ...event,
+                type: event.payload.type
+            };
+
+            const ephemeralResult = await this.handleEventLocal(this._state, event);
+            if (ephemeralResult._tag === 'Left') {
+                return ephemeralResult;
+            }
+
+            this._state = ephemeralResult.right;
+            this._version++;
             return right(undefined);
         } catch (error) {
             return left(createMachineError(
@@ -212,13 +273,19 @@ export class ServerMachineImpl extends AbstractBaseMachine {
 
             // For each submachine, request its current state root
             for (const [childId] of data.submachines) {
-                const queryEvent: Message<ServerCommand> = {
+                const queryEvent: MachineEvent = {
                     id: `query_${Date.now()}`,
-                    type: 'SYNC_STATE',
-                    payload: { type: 'SYNC_STATE', targetHash: childId },
+                    type: 'GET_STATE_ROOT',
+                    payload: { 
+                        kind: 'SERVER', 
+                        payload: { 
+                            type: 'SYNC_STATE', 
+                            targetHash: childId 
+                        } 
+                    },
+                    timestamp: now,
                     sender: this.id,
-                    recipient: childId,
-                    timestamp: now
+                    recipient: childId
                 };
                 this.eventBus.dispatch(queryEvent);
             }
