@@ -11,6 +11,7 @@
     "lint": "pnpm -r lint",
     "simulator": "cd packages/simulator && bun run src/runNodes.ts",
     "dashboard": "cd packages/dashboard && pnpm dev",
+    "predev": "cd packages/core && pnpm build",
     "dev": "concurrently \"pnpm simulator\" \"pnpm dashboard\""
   },
   "keywords": [],

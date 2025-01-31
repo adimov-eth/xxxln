@@ -13,8 +13,9 @@
     }
   },
   "scripts": {
-    "build": "tsc",
-    "clean": "rimraf dist",
+    "prebuild": "pnpm clean",
+    "build": "tsc --build --force --verbose",
+    "clean": "rimraf dist tsconfig.tsbuildinfo",
     "test": "vitest",
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc --noEmit"

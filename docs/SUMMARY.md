@@ -18,4 +18,15 @@
 * [Database](technical/database.md)
 * [Merkle Trees](technical/merkle.md)
 * [Consensus](technical/consensus.md)
-* [Storage](technical/storage.md) 
+* [Storage](technical/storage.md)
+
+## Tutorials
+* [Starting a Local Network](tutorials/local-network.md)
+* [Creating Signers and Entities](tutorials/signer-entity.md)
+* [Working with Channels](tutorials/channels.md)
+
+## Contributing
+* [Development Setup](contributing/setup.md)
+* [Coding Guidelines](contributing/guidelines.md)
+* [Testing](contributing/testing.md)
+* [Documentation](contributing/documentation.md) 
