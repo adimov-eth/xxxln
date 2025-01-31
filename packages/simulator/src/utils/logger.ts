@@ -85,6 +85,48 @@ const formatAccount = (account: string): string =>
 const formatTransaction = (from: string, to: string, amount: number): string =>
   `${COLORS.TRANSACTION('TRANSFER')} ${formatAccount(from)} ${COLORS.ARROW('->')} ${formatAccount(to)} ${COLORS.SEPARATOR('|')} ${formatAmount(amount)}`;
 
+// Format message object for better readability
+const formatMessageObject = (message: any): any => {
+  if (!message) return message;
+  
+  // Format specific fields we know about
+  if (message.type === 'COMMAND' && message.payload?.type === 'TRANSFER') {
+    return {
+      id: message.id,
+      type: message.type,
+      payload: {
+        type: 'TRANSFER',
+        from: formatAccount(message.sender),
+        to: formatAccount(message.recipient),
+        amount: message.payload.amount
+      },
+      timestamp: formatTimestamp(message.timestamp)
+    };
+  }
+  
+  return message;
+};
+
+// Custom replacer for JSON.stringify to handle BigInt and format known objects
+const jsonReplacer = (key: string, value: any): any => {
+  // Handle BigInt
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  
+  // Format full messages
+  if (key === 'fullMessage' || key === 'message') {
+    return formatMessageObject(value);
+  }
+  
+  // Format transaction arrays
+  if (Array.isArray(value) && value.length > 0 && value[0]?.type === 'COMMAND') {
+    return value.map(formatMessageObject);
+  }
+  
+  return value;
+};
+
 // Main logger function
 export const createLogger = (defaultNodeId: string = 'SYSTEM', broadcast?: BroadcastFn) => {
   const log = (level: LogLevel, message: string, nodeId?: string, data?: unknown): void => {
@@ -111,30 +153,31 @@ export const createLogger = (defaultNodeId: string = 'SYSTEM', broadcast?: Broad
       broadcast(plainMessage);
 
       if (data) {
-        const plainData = typeof data === 'object' ? JSON.stringify(data, null, 2) : String(data);
-        broadcast(`  Data: ${plainData}`);
+        const plainData = typeof data === 'object' ? JSON.stringify(data, jsonReplacer, 2) : String(data);
+        broadcast(`  └ Data:     ${plainData}`);
       }
     }
 
     // If there's additional data, format it nicely but compactly
     if (data) {
       if (typeof data === 'object') {
-        const dataStr = JSON.stringify(data);
+        const dataStr = JSON.stringify(data, jsonReplacer, 2);
         if (dataStr.length < 80) {
           // For small objects, show inline
           console.log(COLORS.MUTED('  └ '), dataStr);
+          if (broadcast) broadcast(`  └ ${dataStr}`);
         } else {
           // For larger objects, show multiline
-          console.log(
-            COLORS.MUTED('  └ Data:'),
-            JSON.stringify(data, null, 2)
-              .split('\n')
-              .map(line => '    ' + line)
-              .join('\n')
-          );
+          const formattedData = dataStr
+            .split('\n')
+            .map(line => '    ' + line)
+            .join('\n');
+          console.log(COLORS.MUTED('  └ Data:'), formattedData);
+          if (broadcast) broadcast(`  └ Data:\n${formattedData}`);
         }
       } else {
         console.log(COLORS.MUTED('  └ '), data);
+        if (broadcast) broadcast(`  └ ${data}`);
       }
     }
   };

@@ -58,6 +58,7 @@ export class WebSocketServer {
   private pingTimers = Map<string, NodeJS.Timeout>();
   private readonly PING_INTERVAL = 30000; // 30 seconds
   private readonly PING_TIMEOUT = 5000;  // 5 seconds
+  private seenMessages = new Set<string>();
 
   constructor(port: number, nodeId: string) {
     console.log(`[WebSocketServer] Initializing with nodeId: ${nodeId}`);
@@ -70,21 +71,60 @@ export class WebSocketServer {
 
   private setupServerHandlers(): void {
     this.server.on('connection', (socket: WS) => {
+      console.log(`[WebSocketServer] New connection received`);
+      
+      // Initialize connection with handshake
+      const handshakeMessage = {
+        type: 'HANDSHAKE',
+        payload: this.getNodeInfo(),
+        timestamp: Date.now(),
+        peerId: this.nodeId
+      };
+      socket.send(JSON.stringify(handshakeMessage));
+      
       socket.on('message', (data: string) => {
         try {
           const message = JSON.parse(data) as NetworkMessage;
+          
+          // Handle handshake response
+          if (message.type === 'HANDSHAKE') {
+            const peerInfo = message.payload as NodeInfo;
+            this.peers = this.peers.set(peerInfo.id, socket);
+            this.nodeInfo = this.nodeInfo.set(peerInfo.id, {
+              ...peerInfo,
+              status: 'ACTIVE'
+            });
+            console.log(`[WebSocketServer] Peer ${peerInfo.id} connected. Active peers count: ${this.peers.size}`);
+          } else {
+            console.log(`[WebSocketServer] Received ${message.type} from peer ${message.peerId}`);
+          }
+          
           this.handleMessage(socket, message);
         } catch (error) {
-          console.error('Error handling message:', error);
+          console.error('[WebSocketServer] Error handling message:', error);
         }
       });
 
       socket.on('close', () => {
         const peerId = this.findPeerId(socket);
         if (peerId) {
-          this.removePeer(peerId);
+          console.log(`[WebSocketServer] Peer ${peerId} disconnected`);
+          this.peers = this.peers.remove(peerId);
+          this.nodeInfo = this.nodeInfo.update(peerId, info => info ? {
+            ...info,
+            status: 'INACTIVE' as const
+          } : info);
         }
       });
+
+      socket.on('error', (error) => {
+        const peerId = this.findPeerId(socket);
+        console.error(`[WebSocketServer] Socket error for peer ${peerId}:`, error);
+      });
+    });
+
+    this.server.on('error', (error) => {
+      console.error('[WebSocketServer] Server error:', error);
     });
   }
 
@@ -139,16 +179,50 @@ export class WebSocketServer {
       this.updatePeerLastSeen(peerId);
     }
 
-    const handler = this.messageHandlers.get(message.type);
-    if (handler) {
-      handler({ ...message, peerId });
-      return;
-    }
-
     switch (message.type) {
-      case 'BLOCK':
+      case 'BLOCK': {
+        const networkBlock = message.payload as NetworkBlock;
+        const seenKey = `block:${networkBlock.hash}`;
+        
+        if (!this.seenMessages.has(seenKey)) {
+          console.log(`[WebSocketServer] Processing new block ${networkBlock.hash} from ${peerId}`);
+          this.seenMessages.add(seenKey);
+          
+          // Process block via handler
+          const blockHandler = this.messageHandlers.get('BLOCK');
+          if (blockHandler) {
+            blockHandler({ ...message, peerId });
+            console.log(`[WebSocketServer] Block ${networkBlock.hash} processed locally`);
+          }
+          
+          // Relay to other peers
+          const relayMessage = {
+            type: 'BLOCK',
+            payload: networkBlock,
+            timestamp: Date.now(),
+            peerId: this.nodeId
+          };
+          
+          let relayCount = 0;
+          this.peers.forEach((peer: WS, otherPeerId: string) => {
+            if (otherPeerId !== peerId && peer.readyState === WebSocket.OPEN) {
+              try {
+                peer.send(JSON.stringify(relayMessage));
+                relayCount++;
+              } catch (error) {
+                console.error(`[WebSocketServer] Failed to relay block to ${otherPeerId}:`, error);
+              }
+            }
+          });
+          console.log(`[WebSocketServer] Block ${networkBlock.hash} relayed to ${relayCount} peers`);
+        } else {
+          console.log(`[WebSocketServer] Already processed block ${networkBlock.hash}`);
+        }
+        break;
+      }
+      
       case 'STATE_UPDATE':
-        this.messageHandlers.get(message.type)?.(message);
+        this.messageHandlers.get('STATE_UPDATE')?.(message);
         break;
       
       case 'PING':
@@ -186,6 +260,9 @@ export class WebSocketServer {
       case 'HANDSHAKE':
         await this.handleHandshake(ws, message);
         break;
+
+      default:
+        console.warn(`[WebSocketServer] Unknown message type: ${message.type}`);
     }
   }
 
@@ -257,13 +334,9 @@ export class WebSocketServer {
     }
   }
 
-  private findPeerId(ws: WS): string | undefined {
-    for (const [id, socket] of this.peers.entries()) {
-      if (socket === ws) {
-        return id;
-      }
-    }
-    return undefined;
+  private findPeerId(socket: WS): string | undefined {
+    const entry = this.peers.findEntry(peer => peer === socket);
+    return entry ? entry[0] : undefined;
   }
 
   private async handleHandshake(ws: WS, message: NetworkMessage): Promise<void> {
@@ -285,17 +358,37 @@ export class WebSocketServer {
     }));
   }
 
-  public broadcastMessage(message: NetworkMessage): void {
+  public broadcastMessage(message: NetworkMessage, excludePeerId?: string): void {
     const messageWithPeerId = {
       ...message,
       peerId: this.nodeId
     };
     const messageStr = JSON.stringify(messageWithPeerId);
-    this.peers.forEach((peer: WS) => {
-      if (peer.readyState === WebSocket.OPEN) {
-        peer.send(messageStr);
+    
+    if (message.type === 'BLOCK') {
+      console.log(`[WebSocketServer] Broadcasting BLOCK ${(message.payload as NetworkBlock).hash} to ${this.peers.size} peers`);
+    }
+    
+    let sentCount = 0;
+    this.peers.forEach((peer: WS, peerId: string) => {
+      if (peerId !== excludePeerId && peer.readyState === WebSocket.OPEN) {
+        try {
+          peer.send(messageStr);
+          sentCount++;
+        } catch (error) {
+          console.error(`[WebSocketServer] Failed to send to peer ${peerId}:`, error);
+          this.peers = this.peers.remove(peerId);
+          this.nodeInfo = this.nodeInfo.update(peerId, info => info ? {
+            ...info,
+            status: 'INACTIVE' as const
+          } : info);
+        }
       }
     });
+    
+    if (message.type === 'BLOCK') {
+      console.log(`[WebSocketServer] Block broadcast complete. Sent to ${sentCount} peers`);
+    }
   }
 
   public registerMessageHandler(
@@ -306,7 +399,6 @@ export class WebSocketServer {
   }
 
   public getNodeInfo(): NodeInfo {
-    console.log(`[WebSocketServer] Getting node info for nodeId: ${this.nodeId}`);
     return {
       id: this.nodeId,
       address: 'localhost',
@@ -320,47 +412,48 @@ export class WebSocketServer {
     return this.nodeInfo;
   }
 
-  public async connectToPeer(peerInfo: NodeInfo): Promise<Either<MachineError, void>> {
-    if (peerInfo.id === this.nodeId) {
-      return right(undefined);
-    }
-
+  public async connectToPeer(peer: NodeInfo): Promise<Either<MachineError, void>> {
     try {
-      const ws = new WS(`ws://${peerInfo.address}:${peerInfo.port}`) as WS;
+      console.log(`[WebSocketServer] Connecting to peer ${peer.id} at ws://${peer.address}:${peer.port}`);
+      const ws = new WebSocket(`ws://${peer.address}:${peer.port}`);
       
       return new Promise((resolve) => {
         ws.on('open', () => {
           // Send handshake
-          ws.send(JSON.stringify({
+          const handshakeMessage = {
             type: 'HANDSHAKE',
             payload: this.getNodeInfo(),
             timestamp: Date.now(),
             peerId: this.nodeId
-          }));
-
-          this.peers.set(peerInfo.id, ws);
-          this.nodeInfo = this.nodeInfo.set(peerInfo.id, {
-            ...peerInfo,
+          };
+          ws.send(JSON.stringify(handshakeMessage));
+          
+          // Add to peers
+          this.peers = this.peers.set(peer.id, ws);
+          this.nodeInfo = this.nodeInfo.set(peer.id, {
+            ...peer,
             status: 'ACTIVE'
           });
-
+          
+          console.log(`[WebSocketServer] Successfully connected to peer ${peer.id}`);
           resolve(right(undefined));
         });
 
         ws.on('error', (error) => {
-          resolve(left(createMachineError(
-            'INTERNAL_ERROR',
-            'Failed to connect to peer',
-            error
-          )));
+          console.error(`[WebSocketServer] Error connecting to peer ${peer.id}:`, error);
+          resolve(left({
+            type: 'NETWORK_ERROR',
+            code: 'INTERNAL_ERROR',
+            message: `Failed to connect to peer ${peer.id}`
+          }));
         });
       });
     } catch (error) {
-      return left(createMachineError(
-        'INTERNAL_ERROR',
-        'Failed to connect to peer',
-        error
-      ));
+      return left({
+        type: 'NETWORK_ERROR', 
+        code: 'INTERNAL_ERROR',
+        message: `Failed to connect to peer ${peer.id}`
+      });
     }
   }
 

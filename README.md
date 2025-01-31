@@ -1,96 +1,62 @@
-# Extended Payment Network
+# XXXLN Network
 
-## Overview
-A scalable, decentralized payment network built on an actor-based architecture with hierarchical state management. The system combines off-chain payment channels with multi-signature capabilities and event-driven communication to enable efficient, secure transactions.
+A scalable, decentralized payment network built with TypeScript using functional programming principles.
 
-## Key Features
-- 🏗️ Hierarchical State-Time Machine (HSTM) architecture
-- 🔐 Multi-signature entity support
-- 📨 Actor-based message passing
-- ⚡ Off-chain payment channels
-- 🔄 Event-driven state management
-- 🌐 Distributed consensus mechanism
+## Features
 
-## Documentation
+- Decentralized network architecture
+- Off-chain payment channels with multi-signature security
+- Event-driven communication
+- Functional programming style with immutable data structures
+- Strong type safety with TypeScript
+- Actor-based architecture with hierarchical state management
 
-### Architecture
-- [Overview](docs/architecture/overview.md) - High-level system architecture
-- [Components](docs/architecture/components.md) - Detailed component descriptions
-- [Protocols](docs/architecture/protocols.md) - Communication and consensus protocols
+## Project Structure
 
-### Implementation
-- [State Management](docs/implementation/state-management.md)
-- [Entities](docs/implementation/entities.md)
-- [Channels](docs/implementation/channels.md)
-
-### Technical Details
-- [Merkle Trees](docs/technical/merkle.md)
-- [Consensus](docs/technical/consensus.md)
-- [Storage](docs/technical/storage.md)
-
-## Repository Structure
 ```
 packages/
-├── contracts/    # Smart contracts
-├── node/        # Node implementation
-├── types/       # TypeScript types
-├── webapp/      # Web interface
-└── devtools/    # Development tools
-
-docs/
-├── architecture/  # System architecture
-├── implementation/# Implementation details
-└── technical/     # Technical specifications
+  ├── core/           # Core network functionality
+  ├── simulator/      # Network simulation and testing
+  └── dashboard/      # Network monitoring interface
 ```
 
-## Getting Started
+## Recent Changes
 
-### Prerequisites
-- Node.js 16+
-- TypeScript 4.5+
-- Ethereum development environment
+- Migrated to core Transaction type throughout the codebase
+- Renamed `runSimpleBlockProductionLoop` to `runBlockProductionLoop`
+- Improved type safety in transaction handling
+- Standardized functional programming patterns
 
-### Installation
+## Development
+
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/payment-network.git
-
 # Install dependencies
-yarn install
-
-# Build all packages
-yarn build
+pnpm install
 
 # Run tests
-yarn test
+pnpm test
+
+# Start simulator
+pnpm dev
 ```
 
-### Quick Start
-```typescript
-import { SignerMachine } from '@payment-network/node';
+## Architecture
 
-// Create a signer
-const signer = await SignerMachine.create({
-  privateKey: '0x...',
-  network: 'testnet'
-});
+- Functional core with immutable data structures
+- Event-driven communication between nodes
+- Type-safe message passing using discriminated unions
+- Hierarchical state management
+- Off-chain payment channels with multi-signature security
 
-// Create an entity
-const entity = await signer.createEntity({
-  name: 'MyEntity',
-  threshold: 1
-});
+## Technologies
 
-// Open a payment channel
-const channel = await entity.openChannel({
-  counterparty: '0xCounterpartyAddress',
-  deposit: '1.0',
-  token: 'ETH'
-});
-```
-
-## Contributing
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+- TypeScript
+- fp-ts for functional programming
+- io-ts for runtime type validation
+- immutable.js for immutable data structures
+- Bun runtime
+- pnpm for package management
 
 ## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+MIT

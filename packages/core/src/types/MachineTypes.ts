@@ -1,6 +1,7 @@
 import { Map } from 'immutable';
 import { Machine, MachineId, State } from './Core';
 import { MempoolState, BlockProductionConfig } from './BlockTypes';
+import { BaseMachine } from '../eventbus/BaseMachine';
 
 // Common types for all machines
 export type BlockHash = string;
@@ -98,11 +99,11 @@ export type EntityState = State & Map<string, {
   readonly nonce: number;
 }>;
 
-export type EntityMachine = Machine & {
+export interface EntityMachine extends Machine, BaseMachine {
   readonly type: 'ENTITY';
   readonly state: EntityState;
-  readonly parentId: MachineId; // Signer machine ID
-};
+  readonly parentId: string;
+}
 
 // Channel Machine Types
 export type StateUpdate = {

@@ -1,3 +1,4 @@
+import { ServerCommand } from '@xxxln/core/src/types/Messages';
 import { 
   NetworkManager,
   NodeInfo,
@@ -8,7 +9,6 @@ import {
   BlockHeader,
   MachineId,
   Message,
-  ServerCommand,
   BlockData,
   PublicKey,
   SignatureData,
@@ -18,14 +18,25 @@ import {
   verifyEcdsaSignature,
   MachineError,
   createMachineError,
-  derivePublicKey
+  derivePublicKey,
+  createNodeManagers,
+  initializeNodeNetwork,
+  stopNodeNetwork,
+  subscribeToNodeEvents,
+  runBlockProductionLoop,
+  NodeHealth,
+  LogLevel,
+  createMempoolState,
+  MempoolEntry
 } from '@xxxln/core';
+import type { Transaction, TransactionType } from '@xxxln/core/src/types/MachineTypes';
 import { Map as ImmutableMap } from 'immutable';
 import { createHash } from 'crypto';
 import { createDashboardServer } from './dashboard.js';
-import { Account, BlockchainState, NodeConfig, NodeRole, Transaction, createInitialState } from './types.js';
+import { Account, BlockchainState, NodeConfig, NodeRole, createInitialState, toDashboardState } from './types.js';
 import { createLogger } from './utils/logger.js';
 import { Either, isLeft, right, left } from 'fp-ts/lib/Either.js';
+import { pipe } from 'fp-ts/function';
 import { config } from 'dotenv';
 import { resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -35,69 +46,45 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Load environment variables
-config({ path: resolve(__dirname, '../.env') });
-
-// Validate required environment variables
-const requiredKeys = ['SIGNER1', 'SIGNER2', 'SIGNER3', 'ENTITY1'].map(id => `SIGNER_PRIVATE_KEY_${id}`);
-const missingKeys = requiredKeys.filter(key => !process.env[key]);
-if (missingKeys.length > 0) {
-  throw new Error(`Missing required environment variables: ${missingKeys.join(', ')}`);
-}
-
-// Initialize KeyStorage with keys from environment
-const keys = new Map<string, string>();
-for (const nodeId of ['SIGNER1', 'SIGNER2', 'SIGNER3', 'ENTITY1']) {
-  const key = process.env[`SIGNER_PRIVATE_KEY_${nodeId}`];
-  if (key) {
-    // Store by both public key and node ID
-    const publicKey = derivePublicKey(key);
-    if (isLeft(publicKey)) {
-      throw new Error(`Failed to derive public key for ${nodeId}: ${publicKey.left}`);
-    }
-    keys.set(publicKey.right, key); // Store by public key
-    keys.set(nodeId, key); // Also store by node ID
-  }
-}
-KeyStorage.initialize(keys);
+import * as dotenv from 'dotenv';
+dotenv.config();
 
 // Node configurations
-export const NODES_CONFIG: ReadonlyArray<NodeConfig> = [
-  {
-    id: 'SIGNER1',
-    type: 'signer',
-    privateKey: process.env.SIGNER_PRIVATE_KEY_SIGNER1!,
-    peers: ['SIGNER2', 'SIGNER3'],
-    isBootstrap: true,
+const NODES_CONFIG: ReadonlyArray<NodeConfig> = [
+  { 
     port: 3001,
-    host: 'localhost'
+    id: 'validator1',
+    type: 'signer',
+    host: 'localhost',
+    privateKey: process.env.VALIDATOR1_PRIVATE_KEY || 'test_key_1',
+    peers: ['validator2', 'validator3'],
+    isBootstrap: true
   },
   {
-    id: 'SIGNER2',
+    port: 3002, 
+    id: 'validator2',
     type: 'signer',
-    privateKey: process.env.SIGNER_PRIVATE_KEY_SIGNER2!,
-    peers: ['SIGNER1', 'SIGNER3'],
-    port: 3002,
-    host: 'localhost'
+    host: 'localhost',
+    privateKey: process.env.VALIDATOR2_PRIVATE_KEY || 'test_key_2',
+    peers: ['validator1', 'validator3']
   },
   {
-    id: 'SIGNER3',
-    type: 'signer',
-    privateKey: process.env.SIGNER_PRIVATE_KEY_SIGNER3!,
-    peers: ['SIGNER1', 'SIGNER2'],
     port: 3003,
-    host: 'localhost'
+    id: 'validator3', 
+    type: 'signer',
+    host: 'localhost',
+    privateKey: process.env.VALIDATOR3_PRIVATE_KEY || 'test_key_3',
+    peers: ['validator1', 'validator2']
   },
   {
-    id: 'ENTITY1',
-    type: 'entity',
-    privateKey: process.env.SIGNER_PRIVATE_KEY_ENTITY1!,
-    peers: ['SIGNER1'],
     port: 3004,
-    host: 'localhost'
+    id: 'observer1',
+    type: 'entity',
+    host: 'localhost',
+    privateKey: process.env.OBSERVER1_PRIVATE_KEY || 'test_key_4',
+    peers: ['validator1']
   }
 ] as const;
-
-// KeyStorage will automatically load keys from environment variables
 
 /* -----------------------------
    1) CONFIG & TYPES
@@ -107,13 +94,24 @@ export const NODES_CONFIG: ReadonlyArray<NodeConfig> = [
 const logger = createLogger();
 
 // Default accounts
-const DEFAULT_ACCOUNTS: Account[] = ['account1', 'account2', 'account3', 'account4'];
+const DEFAULT_ACCOUNTS: ReadonlyArray<Account> = ['account1', 'account2', 'account3', 'account4'];
 
-// Add after DEFAULT_ACCOUNTS definition
+// Genesis block
 const GENESIS_BLOCK: NetworkBlock = {
   hash: 'GENESIS',
-  data: createBlock(0, [], 'GENESIS', 'GENESIS' as MachineId),
-  signature: '' // Genesis block has no signature
+  data: {
+    header: {
+      blockNumber: 0,
+      parentHash: 'GENESIS',
+      proposer: 'GENESIS' as MachineId,
+      timestamp: Date.now(),
+      transactionsRoot: '',
+      stateRoot: ''
+    },
+    transactions: [],
+    signatures: ImmutableMap<string, string>()
+  },
+  signature: ''
 };
 
 /* -----------------------------
@@ -121,74 +119,82 @@ const GENESIS_BLOCK: NetworkBlock = {
 ------------------------------ */
 const randomAccount = (): Account => {
   const idx = Math.floor(Math.random() * DEFAULT_ACCOUNTS.length);
-  return DEFAULT_ACCOUNTS[idx]!; // Non-null assertion since array is constant
+  return DEFAULT_ACCOUNTS[idx]!;
 };
 
 const generateTransaction = (): Transaction => {
-  // pick two distinct random accounts
-  let from = randomAccount();
-  let to = randomAccount();
-  while (to === from) {
+  const from = randomAccount();
+  let to;
+  do {
     to = randomAccount();
-  }
+  } while (to === from);
+  
   return {
-    id: Math.random().toString(36).substring(7),
-    from,
-    to,
-    amount: Math.floor(Math.random() * 100) + 1,
-    timestamp: Date.now()
+    type: 'TRANSFER',
+    nonce: Math.floor(Math.random() * 1000),
+    timestamp: Date.now(),
+    sender: from as MachineId,
+    payload: {
+      amount: Math.floor(Math.random() * 100) + 1,
+      recipient: to
+    },
+    metadata: {
+      chainId: 'simulator',
+      validFrom: Date.now(),
+      validUntil: Date.now() + 3600000,
+      gasLimit: BigInt(21000),
+      maxFeePerGas: BigInt(1000000000)
+    }
   };
 };
 
-const simulateLatency = async () => {
+const simulateLatency = async (): Promise<void> => {
   const latency = Math.random() * 200 + 100; // 100-300ms latency
-  return new Promise(resolve => setTimeout(resolve, latency));
+  await new Promise(resolve => setTimeout(resolve, latency));
 };
 
 /* -----------------------------
    3) BLOCK CREATION / HASHING
 ------------------------------ */
 
-// Function declarations first
-function computeStateRoot(transactions: Transaction[]): string {
+const computeStateRoot = (transactions: ReadonlyArray<Transaction>): string => {
   const txData = transactions.map(tx => 
-    `${tx.from}-${tx.to}-${tx.amount}-${tx.timestamp}`
+    `${tx.sender}-${(tx.payload as any).recipient}-${(tx.payload as any).amount}-${tx.timestamp}`
   ).join('|');
   return createHash('sha256').update(txData).digest('hex');
-}
+};
 
-function computeTransactionsRoot(transactions: Transaction[]): string {
+const computeTransactionsRoot = (transactions: ReadonlyArray<Transaction>): string => {
   const txHashes = transactions.map(tx => 
     createHash('sha256')
-      .update(`${tx.id}-${tx.from}-${tx.to}-${tx.amount}`)
+      .update(`${tx.nonce}-${tx.sender}-${(tx.payload as any).recipient}-${(tx.payload as any).amount}`)
       .digest('hex')
   );
   return createHash('sha256').update(txHashes.join('')).digest('hex');
-}
+};
 
-function createBlock(
+const createBlock = (
   height: number,
-  transactions: Transaction[],
+  transactions: ReadonlyArray<Transaction>,
   parentHash: string,
   proposerId: MachineId
-): Block {
-  // Convert transactions to messages
-  const txMessages: ReadonlyArray<Message<ServerCommand>> = transactions.map(tx => {
-    const msg: Message<ServerCommand> = {
-      id: tx.id,
-      type: 'COMMAND',
-      payload: {
-        type: 'TRANSFER',
-        amount: tx.amount
-      },
-      sender: tx.from as MachineId,
-      recipient: tx.to as MachineId,
-      timestamp: tx.timestamp
-    };
-    return msg;
-  });
+): Block => {
+  logger.debug('Creating block:', undefined, { height, proposerId, txCount: transactions.length });
 
-  // Create block header
+  const txMessages: ReadonlyArray<Message<ServerCommand>> = transactions.map(tx => ({
+    id: tx.nonce.toString(),
+    type: 'COMMAND',
+    payload: {
+      type: 'TRANSFER',
+      amount: (tx.payload as any).amount,
+      from: tx.sender,
+      to: (tx.payload as any).recipient
+    },
+    sender: tx.sender,
+    recipient: (tx.payload as any).recipient,
+    timestamp: tx.timestamp
+  }));
+
   const header: BlockHeader = {
     blockNumber: height,
     parentHash,
@@ -198,481 +204,454 @@ function createBlock(
     stateRoot: computeStateRoot(transactions)
   };
 
-  // Create block data with explicit type cast
-  const blockData = {
+  const block = {
     header,
     transactions: txMessages,
     signatures: ImmutableMap<string, string>()
-  } as unknown as Block;
+  };
 
-  return blockData;
-}
-
-// Add signature verification function
-async function verifyBlockSignature(
-  block: NetworkBlock,
-  proposerId: string
-): Promise<Either<MachineError, boolean>> {
-  if (!block.signature) {
-    return right(false);
-  }
-
-  // Get proposer's public key
-  const publicKeyResult = getKeyStorage().getPublicKey(proposerId);
-  if (isLeft(publicKeyResult)) {
-    return left(createMachineError(
-      'INTERNAL_ERROR',
-      `Failed to get public key for proposer ${proposerId}`,
-      publicKeyResult.left
-    ));
-  }
-
-  // Compute block hash for verification
-  const blockHash = createHash('sha256')
-    .update(JSON.stringify(block.data))
-    .digest();
-
-  // Verify signature
-  return verifyEcdsaSignature(blockHash, block.signature, publicKeyResult.right);
-}
-
-// Add block signing function
-async function signBlock(
-  block: Block,
-  proposerId: string
-): Promise<Either<MachineError, string>> {
-  // Get private key from storage
-  const privateKeyResult = getKeyStorage().getPrivateKey(proposerId);
-  if (isLeft(privateKeyResult)) {
-    return left(createMachineError(
-      'INTERNAL_ERROR',
-      `Failed to get private key for proposer ${proposerId}`,
-      privateKeyResult.left
-    ));
-  }
-
-  // Compute block hash
-  const blockHash = createHash('sha256')
-    .update(JSON.stringify(block))
-    .digest();
-
-  // Sign block hash
-  return createEcdsaSignature(blockHash, privateKeyResult.right);
-}
+  logger.debug('Created block:', undefined, { block });
+  return block as unknown as Block;
+};
 
 /* -----------------------------
    4) SIMULATION MAIN
 ------------------------------ */
-async function main() {
-  const nodes: NetworkManager[] = [];
+async function main(): Promise<void> {
   const eventBus = new CentralEventBus();
-  const dashboard = createDashboardServer(4000);
+  const nodeHealthMap = new Map<string, NodeHealth>();
 
-  // Initialize logger with dashboard broadcasting
-  const logger = createLogger('SYSTEM', message => dashboard.broadcastLog(message));
+  // Initialize KeyStorage with node private keys
+  const initialKeys = new Map(
+    NODES_CONFIG.map(node => [
+      node.id,
+      node.privateKey
+    ])
+  );
+  KeyStorage.initialize(initialKeys);
 
-  // For demonstration, we store a local chain state for each node by ID
-  const localStates: Record<string, BlockchainState> = {};
+  // Initialize dashboard server
+  const dashboardServer = createDashboardServer(3100);
+  await dashboardServer.start();
 
-  // Initialize local chain states
-  for (const config of NODES_CONFIG) {
-    localStates[config.id] = {
-      ...createInitialState(),
-      blocks: ImmutableMap<string, NetworkBlock>().set('GENESIS', GENESIS_BLOCK),
-      tipHash: 'GENESIS'
-    };
+  // Set up logger with dashboard broadcast
+  const logger = createLogger('SYSTEM', message => dashboardServer.broadcastLog(message));
+
+  // Create network managers
+  const managersResult = await pipe(
+    NODES_CONFIG,
+    configs => createNodeManagers(configs, eventBus, 'INFO' as any, 2000, nodeHealthMap)
+  );
+
+  if (isLeft(managersResult)) {
+    console.error('Failed to create network:', managersResult.left);
+    process.exit(1);
   }
 
-  /* -----------------------------
-     4.1 CREATE NETWORK NODES
-  ------------------------------ */
-  for (const config of NODES_CONFIG) {
-    const nodeInfo: NodeInfo = {
-      id: config.id,
-      address: config.host,
-      port: config.port,
-      publicKey: `key_${config.id}`,
-      status: 'ACTIVE'
-    };
+  const managers = managersResult.right;
 
-    // initial peers = all others
-    const initialPeers = NODES_CONFIG
-      .filter(c => c.id !== config.id)
-      .map(c => ({
-        id: c.id,
-        address: c.host,
-        port: c.port,
-        publicKey: `key_${c.id}`,
-        status: 'ACTIVE' as const
-      }));
+  // Initialize network
+  const initResult = await initializeNodeNetwork(managers, {
+    blockProductionInterval: 5000,
+    maxTransactionsPerBlock: 100,
+    networkTimeout: 5000,
+    retryAttempts: 3,
+    topology: 'MESH'
+  });
 
-    const node = new NetworkManager(
-      config.port,
-      initialPeers,
-      config.id
-    );
-    logger.debug(`Created node with config ID ${config.id}, actual ID: ${node.getNodeInfo().id}`);
-    logger.debug(`Node info:`, config.id, node.getNodeInfo());
-    nodes.push(node);
+  if (isLeft(initResult)) {
+    console.error('Failed to initialize network:', initResult.left);
+    process.exit(1);
+  }
+
+  logger.info('Network created successfully!', undefined, { nodes: [...managers.keys()] });
+
+  // Wait a bit for peers to connect
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
+  // Create initial blockchain state
+  let blockchainState = createInitialState();
+
+  // Initialize mempool state
+  let mempoolState = createMempoolState(10000);
+
+  // Type guard for TRANSFER command
+  const isTransferCommand = (cmd: ServerCommand): cmd is Extract<ServerCommand, { type: 'TRANSFER' }> => {
+    return cmd.type === 'TRANSFER';
+  };
+
+  // Subscribe to transaction events
+  subscribeToNodeEvents(managers, (nodeId, event) => {
+    logger.debug(`[${nodeId}] Received event: ${event.type}`, undefined, { 
+      event,
+      eventType: typeof event,
+      payloadType: typeof event.payload,
+      fullPayload: JSON.stringify(event.payload, null, 2)
+    });
     
-    // Wait for WebSocket server to be ready
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    /* --------------------------------
-       4.2 BLOCK REQUEST HANDLER
-    --------------------------------- */
-    node.onBlockRequest(async (blockHash: string) => {
-      await simulateLatency();
-      const nodeState = localStates[config.id];
+    if (event.type === 'COMMAND' && event.payload && typeof event.payload === 'object' && 'event' in event.payload) {
+      const message = (event.payload as { event: Message<ServerCommand> }).event;
       
-      if (!nodeState) {
-        logger.error(`No local state found for block request`, config.id);
+      if (!message) {
+        logger.debug('No message in event payload');
+        return;
+      }
+
+      logger.debug(`Processing command message`, undefined, { 
+        message,
+        messageType: typeof message,
+        payloadType: typeof message.payload,
+        fullMessage: JSON.stringify(message, null, 2)
+      });
+      
+      if (message.type === 'COMMAND' && message.payload?.type === 'TRANSFER') {
+        const transferPayload = message.payload as { 
+          type: 'TRANSFER'; 
+          amount: number; 
+          from: string; 
+          to: string 
+        };
+        
+        logger.debug(`Transfer command details:`, undefined, {
+          payloadType: typeof transferPayload,
+          payloadKeys: Object.keys(transferPayload),
+          fullPayload: JSON.stringify(transferPayload, null, 2)
+        });
+        
+        const tx: Transaction = {
+          type: 'TRANSFER',
+          nonce: parseInt(message.id),
+          timestamp: message.timestamp,
+          sender: message.sender,
+          payload: {
+            amount: transferPayload.amount,
+            recipient: message.recipient
+          },
+          metadata: {
+            chainId: 'simulator',
+            validFrom: message.timestamp,
+            validUntil: message.timestamp + 3600000,
+            gasLimit: BigInt(21000),
+            maxFeePerGas: BigInt(1000000000)
+          }
+        };
+
+        const entry: MempoolEntry = {
+          transaction: message,
+          receivedAt: Date.now(),
+          gasPrice: BigInt(1),
+          nonce: parseInt(message.id)
+        };
+
+        mempoolState = {
+          ...mempoolState,
+          pending: mempoolState.pending.set(message.id, entry),
+          currentSize: mempoolState.currentSize + 1
+        };
+
+        logger.debug(`Added to mempool`, undefined, { 
+          id: message.id, 
+          entry,
+          pendingCount: mempoolState.currentSize,
+          allPending: [...mempoolState.pending.entries()]
+        });
+      }
+    }
+  });
+
+  // Register block handler for each manager
+  for (const [nodeId, manager] of managers) {
+    manager.onBlock((rawBlock: unknown) => {
+      logger.debug(`[${nodeId}] Received block:`, undefined, { 
+        rawBlock,
+        rawBlockType: typeof rawBlock,
+        rawBlockKeys: rawBlock ? Object.keys(rawBlock as object) : []
+      });
+      
+      const block = rawBlock as NetworkBlock;
+      const blockData = block.data as Block;
+      
+      if (!blockData || !blockData.header) {
+        logger.error('Invalid block data received:', undefined, { block });
+        return;
+      }
+
+      logger.info(`[${nodeId}] New block produced: #${blockData.header.blockNumber}`, undefined, {
+        hash: block.hash,
+        transactions: blockData.transactions.length,
+        proposer: blockData.header.proposer,
+        blockData: JSON.stringify(blockData, null, 2)
+      });
+      
+      // Update state with transactions
+      blockData.transactions.forEach(tx => {
+        const command = tx.payload;
+        if (command.type === 'TRANSFER') {
+          // Update balances
+          const from = tx.sender as Account;
+          const to = tx.recipient as Account;
+          const amount = command.amount;
+
+          const currentFromBalance = blockchainState.balances.get(from) || 0;
+          const currentToBalance = blockchainState.balances.get(to) || 0;
+
+          logger.debug(`[${nodeId}] Updating balances: ${from}(${currentFromBalance}) -> ${to}(${currentToBalance}), amount: ${amount}`);
+
+          blockchainState = {
+            ...blockchainState,
+            balances: blockchainState.balances
+              .set(from, currentFromBalance - amount)
+              .set(to, currentToBalance + amount)
+          };
+
+          // Remove from pending
+          mempoolState = {
+            ...mempoolState,
+            pending: mempoolState.pending.remove(tx.id),
+            currentSize: mempoolState.currentSize - 1
+          };
+        }
+      });
+
+      // Update block info
+      blockchainState = {
+        ...blockchainState,
+        height: blockData.header.blockNumber,
+        tipHash: block.hash
+      };
+
+      // Broadcast updated state
+      dashboardServer.broadcastNetworkState({
+        nodeStates: Object.fromEntries(
+          [...managers.keys()].map(nodeId => [
+            nodeId,
+            {
+              ...toDashboardState(blockchainState),
+              balances: Object.fromEntries(blockchainState.balances) as Record<Account, number>
+            }
+          ])
+        ),
+        nodeConfigs: NODES_CONFIG
+      });
+
+      logger.info(`[${nodeId}] Updated balances:`, undefined, {
+        before: Object.fromEntries(blockchainState.balances),
+        updates: blockData.transactions.map(tx => {
+          const command = tx.payload;
+          return command.type === 'TRANSFER' ? {
+            from: tx.sender,
+            to: tx.recipient,
+            amount: command.amount
+          } : null;
+        }).filter(Boolean)
+      });
+    });
+  }
+
+  // Broadcast initial state to dashboard
+  dashboardServer.broadcastNetworkState({
+    nodeStates: Object.fromEntries(
+      [...managers.keys()].map(nodeId => [
+        nodeId,
+        {
+          ...toDashboardState(blockchainState),
+          balances: Object.fromEntries(blockchainState.balances) as Record<Account, number>
+        }
+      ])
+    ),
+    nodeConfigs: NODES_CONFIG
+  });
+
+  // Set up shutdown handler
+  let running = true;
+  process.on('SIGINT', async () => {
+    logger.info('Shutting down simulation...');
+    running = false;
+    await stopNodeNetwork(managers);
+    await dashboardServer.close();
+    process.exit();
+  });
+
+  // Start periodic state updates
+  setInterval(() => {
+    dashboardServer.broadcastNetworkState({
+      nodeStates: Object.fromEntries(
+        [...managers.keys()].map(nodeId => [
+          nodeId,
+          {
+            ...toDashboardState(blockchainState),
+            balances: Object.fromEntries(blockchainState.balances) as Record<Account, number>
+          }
+        ])
+      ),
+      nodeConfigs: NODES_CONFIG
+    });
+  }, 1000);
+
+  // Start transaction simulation
+  const simulateTransactions = () => {
+    if (!running) return;
+
+    // Generate 1-3 transactions
+    const txCount = Math.floor(Math.random() * 3) + 1;
+    logger.debug(`Generating ${txCount} new transactions`);
+    
+    for (let i = 0; i < txCount; i++) {
+      const tx = generateTransaction();
+      logger.info(`Generated transaction: ${tx.sender} -> ${(tx.payload as any).recipient} (${(tx.payload as any).amount})`);
+      
+      // Broadcast to a random validator
+      const validators = [...managers.keys()].filter(id => id.includes('validator'));
+      const randomValidator = validators[Math.floor(Math.random() * validators.length)]!;
+      const manager = managers.get(randomValidator)!;
+      
+      logger.info(`Broadcasting transaction to validator ${randomValidator}`);
+
+      // Emit the message to the event bus
+      const message: Message<ServerCommand> = {
+        id: tx.nonce.toString(),
+        type: 'COMMAND',
+        payload: {
+          type: 'TRANSFER',
+          amount: (tx.payload as any).amount,
+          from: tx.sender,
+          to: (tx.payload as any).recipient
+        },
+        sender: tx.sender,
+        recipient: (tx.payload as any).recipient,
+        timestamp: tx.timestamp
+      };
+
+      manager.emit('message', {
+        type: 'COMMAND',
+        payload: {
+          event: message
+        },
+        timestamp: Date.now()
+      });
+
+      logger.info(`Transaction broadcast complete: ${tx.nonce}`);
+    }
+
+    // Schedule next batch with longer interval
+    setTimeout(simulateTransactions, Math.random() * 2000 + 1000); // 1-3s interval
+  };
+
+  // Start simulation
+  logger.info('Starting transaction simulation...');
+  simulateTransactions();
+
+  // Run block production loop
+  logger.info('Starting block production...');
+  await runBlockProductionLoop(
+    managers,
+    () => {
+      // Get all pending transactions
+      const entries = [...mempoolState.pending.values()];
+
+      // Map entries for logging, safely handling types
+      const pendingTxs = entries.map(entry => {
+        const payload = entry.transaction.payload;
+        if (isTransferCommand(payload)) {
+          return {
+            id: entry.transaction.id,
+            from: entry.transaction.sender,
+            to: entry.transaction.recipient,
+            amount: payload.amount
+          };
+        }
+        return null;
+      }).filter((tx): tx is NonNullable<typeof tx> => tx !== null);
+
+      logger.debug(`Fetching transactions for block production. Pending count: ${entries.length}`, undefined, {
+        pendingTxs
+      });
+
+      // Return first transaction if available
+      if (entries.length === 0) {
+        logger.debug('No pending transactions for block production');
         return undefined;
       }
 
-      const requestedBlock = nodeState.blocks.get(blockHash);
-      if (requestedBlock) {
-        logger.info(`Responding to block request for ${blockHash}`, config.id);
-        return requestedBlock;
-      }
-      return undefined;
-    });
+      const entry = entries[0]!;
+      const transferCommand = entry.transaction.payload;
 
-    /* --------------------------------
-       4.3 BLOCK HANDLER
-    --------------------------------- */
-    node.onBlock(async (blockData: unknown) => {
-      await simulateLatency();
-      const networkBlock = blockData as NetworkBlock;
-      const block = networkBlock.data as Block;
-      const nodeState = localStates[config.id];
-      
-      if (!nodeState) {
-        logger.error(`No local state found`, config.id);
-        return;
+      if (!isTransferCommand(transferCommand)) {
+        logger.debug('Selected transaction is not a transfer');
+        return undefined;
       }
 
-      logger.info(`Received BLOCK #${block.header.blockNumber} hash=${networkBlock.hash}`, config.id);
+      logger.debug(`Selected transaction for block: ${entry.transaction.sender} -> ${entry.transaction.recipient} (${transferCommand.amount})`);
 
-      // If we already have it, ignore
-      if (nodeState.blocks.has(networkBlock.hash)) {
-        return;
-      }
-
-      // Verify block signature
-      const signatureResult = await verifyBlockSignature(networkBlock, block.header.proposer);
-      if (isLeft(signatureResult)) {
-        logger.error(`Failed to verify block signature: ${signatureResult.left.message}`, config.id);
-        return;
-      }
-      if (!signatureResult.right) {
-        logger.error(`Invalid block signature`, config.id);
-        return;
-      }
-
-      // Store the block in local DB
-      localStates[config.id] = {
-        ...nodeState,
-        blocks: nodeState.blocks.set(networkBlock.hash, networkBlock)
+      // Move to processing
+      mempoolState = {
+        ...mempoolState,
+        pending: mempoolState.pending.remove(entry.transaction.id),
+        processing: mempoolState.processing.set(entry.transaction.id, entry),
+        currentSize: mempoolState.currentSize - 1
       };
-      
-      // Handle genesis block request
-      if (block.header.parentHash === 'GENESIS' && !nodeState.blocks.has('GENESIS')) {
-        logger.info(`Requesting missing parent GENESIS`, config.id);
-        localStates[config.id] = {
-          ...localStates[config.id],
-          blocks: localStates[config.id].blocks.set('GENESIS', GENESIS_BLOCK),
-          tipHash: 'GENESIS'
-        };
-      }
 
-      // Fork choice rule: accept block only if:
-      // 1. It extends our current chain (parent is our tip)
-      // 2. OR it has higher block number than our current tip AND we have its parent
-      // 3. OR it's a block with parentHash === 'GENESIS' and we have the GENESIS block
-      const shouldAccept = 
-        block.header.parentHash === nodeState.tipHash ||
-        (block.header.blockNumber > nodeState.height && nodeState.blocks.has(block.header.parentHash)) ||
-        (block.header.parentHash === 'GENESIS' && nodeState.blocks.has('GENESIS'));
+      // Convert to Transaction type
+      const tx: Transaction = {
+        type: 'TRANSFER',
+        nonce: parseInt(entry.transaction.id),
+        timestamp: entry.transaction.timestamp,
+        sender: entry.transaction.sender,
+        payload: {
+          amount: transferCommand.amount,
+          recipient: entry.transaction.recipient
+        },
+        metadata: {
+          chainId: 'simulator',
+          validFrom: entry.transaction.timestamp,
+          validUntil: entry.transaction.timestamp + 3600000,
+          gasLimit: BigInt(21000),
+          maxFeePerGas: BigInt(1000000000)
+        }
+      };
 
-      // Debug logging for OBSERVER nodes
-      if (config.type === 'entity') {
-        const condition1 = block.header.parentHash === nodeState.tipHash;
-        const condition2 = block.header.blockNumber > nodeState.height && nodeState.blocks.has(block.header.parentHash);
-        const condition3 = block.header.parentHash === 'GENESIS' && nodeState.blocks.has('GENESIS');
-        logger.debug(`Block #${block.header.blockNumber} validation:
-          parentHash=${block.header.parentHash}, tipHash=${nodeState.tipHash}, height=${nodeState.height}
-          hasParent=${nodeState.blocks.has(block.header.parentHash)}, hasGenesis=${nodeState.blocks.has('GENESIS')}
-          c1=${condition1}, c2=${condition2}, c3=${condition3}, shouldAccept=${shouldAccept}`, config.id);
-      }
+      return tx;
+    },
+    msg => logger.info(`[BlockProduction] ${msg}`),
+    () => !running,
+    5000
+  );
+}
 
-      if (shouldAccept) {
-        // Reconstruct transaction data
-        const transactions = block.transactions.map((txMsg: Message<ServerCommand>) => ({
-          id: txMsg.id,
-          from: txMsg.sender as Account,
-          to: txMsg.recipient as Account,
-          amount: (txMsg.payload as Extract<ServerCommand, { type: 'TRANSFER' }>).amount,
-          timestamp: txMsg.timestamp
-        } as Transaction));
-
-        // Log transactions
-        logger.info(`Processing ${transactions.length} transactions from block #${block.header.blockNumber}`, config.id);
-        
-        // Apply to local balances using immutable updates
-        localStates[config.id] = transactions.reduce((state, tx) => {
-          const newState = {
-            ...state,
-            balances: state.balances
-              .update(tx.from, (balance = 0) => balance - tx.amount)
-              .update(tx.to, (balance = 0) => balance + tx.amount)
-          };
-          
-          // Log transaction and balances
-          logger.transaction(tx.from, tx.to, tx.amount, config.id);
-          logger.balance(tx.from, newState.balances.get(tx.from) || 0, config.id);
-          logger.balance(tx.to, newState.balances.get(tx.to) || 0, config.id);
-          
-          return newState;
-        }, localStates[config.id]);
-
-        // Update height and tip hash
-        localStates[config.id] = {
-          ...localStates[config.id],
-          height: block.header.blockNumber,
-          tipHash: networkBlock.hash
-        };
-
-        // Broadcast updated state to dashboard
-        const dashboardState = Object.fromEntries(
-          Object.entries(localStates).map(([id, state]) => [
-            id,
-            {
-              height: state.height,
-              balances: ImmutableMap(
-                Object.entries(state.balances.toObject()).map(([key, value]) => [
-                  key as Account,
-                  value
-                ])
-              ),
-              tipHash: state.tipHash,
-              blocks: state.blocks
-            }
-          ])
-        );
-
-        dashboard.broadcastNetworkState({
-          nodeStates: dashboardState,
-          nodeConfigs: NODES_CONFIG
-        });
-      } else {
-        // Request missing parent if needed
-        if (block.header.parentHash && !nodeState.blocks.has(block.header.parentHash)) {
-          logger.info(`Requesting missing parent ${block.header.parentHash}`, config.id);
-          // For OBSERVER nodes, also log the request
-          if (config.type === 'entity') {
-            logger.debug(`Requesting block ${block.header.parentHash} from peers`, config.id);
-          }
-          await node.requestBlock(block.header.parentHash);
-          
-          // Wait a bit for the parent block to arrive
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-          // Re-evaluate the block with the new parent
-          if (nodeState.blocks.has(block.header.parentHash)) {
-            logger.info(`Successfully received requested block ${block.header.parentHash}`, config.id);
-            // Re-evaluate shouldAccept conditions
-            const shouldAcceptAfterParent = 
-              block.header.parentHash === nodeState.tipHash ||
-              (block.header.blockNumber > nodeState.height && nodeState.blocks.has(block.header.parentHash)) ||
-              (block.header.parentHash === 'GENESIS' && nodeState.blocks.has('GENESIS'));
-
-            if (shouldAcceptAfterParent) {
-              // Process the block's transactions
-              const transactions = block.transactions.map((txMsg: Message<ServerCommand>) => ({
-                id: txMsg.id,
-                from: txMsg.sender as Account,
-                to: txMsg.recipient as Account,
-                amount: (txMsg.payload as Extract<ServerCommand, { type: 'TRANSFER' }>).amount,
-                timestamp: txMsg.timestamp
-              } as Transaction));
-
-              logger.info(`Processing ${transactions.length} transactions from block #${block.header.blockNumber} after receiving parent`, config.id);
-              
-              // Apply transactions
-              localStates[config.id] = transactions.reduce((state, tx) => {
-                const newState = {
-                  ...state,
-                  balances: state.balances
-                    .update(tx.from, (balance = 0) => balance - tx.amount)
-                    .update(tx.to, (balance = 0) => balance + tx.amount)
-                };
-                
-                // Log transaction and balances
-                logger.transaction(tx.from, tx.to, tx.amount, config.id);
-                logger.balance(tx.from, newState.balances.get(tx.from) || 0, config.id);
-                logger.balance(tx.to, newState.balances.get(tx.to) || 0, config.id);
-                
-                return newState;
-              }, localStates[config.id]);
-
-              // Update height and tip hash
-              localStates[config.id] = {
-                ...localStates[config.id],
-                height: block.header.blockNumber,
-                tipHash: networkBlock.hash
-              };
-
-              logger.info(`Successfully processed block #${block.header.blockNumber} after receiving parent`, config.id);
-            } else {
-              logger.warn(`Block #${block.header.blockNumber} still not acceptable after receiving parent`, config.id);
-            }
-          }
+function waitForAllPeers(
+  managers: Map<string, NetworkManager>,
+  configs: ReadonlyArray<NodeConfig>
+): Promise<void> {
+  return new Promise((resolve) => {
+    // Checks if all managers see their expected # of peers
+    const checkAllConnected = () => {
+      for (const [nodeId, manager] of managers) {
+        const cfg = configs.find(c => c.id === nodeId);
+        if (!cfg) continue;
+        if (manager.getPeers().size < cfg.peers.length) {
+          return false; // Not all peers discovered yet
         }
       }
-    });
+      return true;
+    };
 
-    /* --------------------------------
-       4.3 STATE UPDATE HANDLER
-    --------------------------------- */
-    node.onStateUpdate(async (update: any) => {
-      await simulateLatency();
-      logger.info(`STATE from node=${update.nodeId}, height=${update.height}, tip=${update.tip}`, config.id);
-      logger.debug(`Balances:`, config.id, update.balances);
-    });
-  }
-
-  /* -----------------------------
-     5) START DASHBOARD & WAIT FOR CONNECTIONS
-  ------------------------------ */
-  await dashboard.start();
-  await new Promise(resolve => setTimeout(resolve, 1000));
-  logger.info('\nNetwork established, starting improved simulation...\n');
-
-  /* -----------------------------
-     6) SIMULATION LOOP
-  ------------------------------ */
-  let running = true;
-  
-  const runSimulation = async () => {
-    while (running) {
-      // Generate random transactions
-      const numTx = Math.floor(Math.random() * 3) + 1;
-      const transactions = Array.from({ length: numTx }, () => generateTransaction());
-      
-      // Pick a random validator to produce the block
-      const validatorNodes = NODES_CONFIG.filter(n => n.type === 'signer');
-      if (validatorNodes.length > 0) {
-        const proposerConfig = validatorNodes[Math.floor(Math.random() * validatorNodes.length)]!;
-        const proposerNode = nodes.find(n => n.getNodeInfo().id === proposerConfig.id);
-        
-        if (!proposerNode) {
-          logger.error(`No node found for proposer ${proposerConfig.id}`);
-          continue;
+    // Whenever a new peer connects, or a handshake completes, we re-check
+    for (const [, manager] of managers) {
+      manager.on('newPeer', () => {
+        if (checkAllConnected()) {
+          resolve();
         }
-
-        const nodeState = localStates[proposerConfig.id];
-        if (!nodeState) {
-          logger.error(`No state found for proposer ${proposerConfig.id}`);
-          continue;
-        }
-
-        const newHeight = nodeState.height + 1;
-        const parentHash = nodeState.tipHash || 'GENESIS';
-
-        // Build a new block
-        const block = createBlock(
-          newHeight,
-          transactions,
-          parentHash,
-          proposerConfig.id as MachineId
-        );
-
-        // Sign the block
-        const signatureResult = await signBlock(block, proposerConfig.id);
-        if (isLeft(signatureResult)) {
-          logger.error(`Failed to sign block: ${signatureResult.left.message}`, proposerConfig.id);
-          continue;
-        }
-
-        const networkBlock: NetworkBlock = {
-          hash: createHash('sha256').update(JSON.stringify(block)).digest('hex'),
-          data: block,
-          signature: signatureResult.right
-        };
-        
-        // Process the block locally first
-        // Apply transactions to local state
-        localStates[proposerConfig.id] = transactions.reduce((state, tx) => {
-          const newState = {
-            ...state,
-            balances: state.balances
-              .update(tx.from, (balance = 0) => balance - tx.amount)
-              .update(tx.to, (balance = 0) => balance + tx.amount)
-          };
-          
-          // Log transaction and balances
-          logger.transaction(tx.from, tx.to, tx.amount, proposerConfig.id);
-          logger.balance(tx.from, newState.balances.get(tx.from) || 0, proposerConfig.id);
-          logger.balance(tx.to, newState.balances.get(tx.to) || 0, proposerConfig.id);
-          
-          return newState;
-        }, localStates[proposerConfig.id]);
-
-        // Update height and store block
-        localStates[proposerConfig.id] = {
-          ...localStates[proposerConfig.id],
-          height: newHeight,
-          blocks: localStates[proposerConfig.id].blocks.set(networkBlock.hash, networkBlock),
-          tipHash: networkBlock.hash
-        };
-        
-        logger.block(newHeight, networkBlock.hash, proposerConfig.id);
-        // Broadcast to all peers
-        proposerNode.broadcastBlock(networkBlock);
-
-        // Update dashboard immediately with new state
-        const dashboardState = Object.fromEntries(
-          Object.entries(localStates).map(([id, state]) => [
-            id,
-            {
-              height: state.height,
-              balances: ImmutableMap(
-                Object.entries(state.balances.toObject()).map(([key, value]) => [
-                  key as Account,
-                  value
-                ])
-              ),
-              tipHash: state.tipHash,
-              blocks: state.blocks
-            }
-          ])
-        );
-
-        dashboard.broadcastNetworkState({
-          nodeStates: dashboardState,
-          nodeConfigs: NODES_CONFIG
-        });
-      }
-
-      // Sleep a bit
-      await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 1000));
+      });
     }
-  };
 
-  runSimulation();
-
-  // Cleanup
-  process.on('SIGINT', async () => {
-    logger.info('\nShutting down simulation...');
-    running = false;
-    nodes.forEach(n => n.close());
-    await dashboard.close();
-    process.exit();
+    // Do an initial check if everything is already connected
+    if (checkAllConnected()) {
+      resolve();
+    }
   });
 }
 
 main().catch(error => {
-  logger.error('Fatal error:', undefined, error);
+  console.error('Fatal error in simulation:', error);
   process.exit(1);
 });

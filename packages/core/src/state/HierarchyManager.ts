@@ -2,12 +2,12 @@ import { Either, left, right } from 'fp-ts/Either';
 import { pipe } from 'fp-ts/function';
 import { MachineError, createMachineError, MachineId } from '../types/Core';
 import { EntityMachine, EntityConfig, EntityState } from '../types/MachineTypes';
-import { ServerMachine } from '../types/MachineTypes';
+import { ServerMachine, ServerState } from '../types/MachineTypes';
 import { SignerMachine } from '../types/MachineTypes';
 import { Map } from 'immutable';
 import { createHash } from 'crypto';
 import { CentralEventBus } from '../eventbus/EventBus';
-import { ActorMachine } from '../eventbus/BaseMachine';
+import { ActorMachine, BaseMachine } from '../eventbus/BaseMachine';
 
 /**
  * Create a new EntityMachine for a given signer machine.
@@ -38,7 +38,7 @@ export function attachEntityToServer(
   entity: EntityMachine
 ): Either<MachineError, ServerMachine> {
   try {
-    const serverData = server.state.get('data');
+    const serverData = server.state.get('data') as { submachines: Map<string, string> };
     if (!serverData) {
       return left(createMachineError('INVALID_STATE', 'Server state data is missing'));
     }
@@ -76,7 +76,12 @@ export function connectSignerToEntity(
   weight: number
 ): Either<MachineError, EntityMachine> {
   try {
-    const entityData = entity.state.get(entity.id);
+    const entityData = entity.state.get(entity.id) as { 
+      config: EntityConfig;
+      channels: Map<string, string>;
+      balance: bigint;
+      nonce: number;
+    };
     if (!entityData) {
       return left(createMachineError('INVALID_STATE', 'Entity data not found'));
     }
@@ -85,7 +90,10 @@ export function connectSignerToEntity(
     }
 
     // Insert or update signers map
-    const updatedSigners = entityData.config.signers.set(newSigner.state.get('data')?.publicKey ?? '', weight);
+    const updatedSigners = entityData.config.signers.set(
+      (newSigner.state.get('data') as { publicKey: string })?.publicKey ?? '', 
+      weight
+    );
 
     const newConfig = {
       ...entityData.config,
@@ -119,7 +127,7 @@ export function connectSignerToEntity(
  */
 export function registerEntityOnEventBus(
   eventBus: CentralEventBus,
-  entityMachine: ActorMachine
+  entityMachine: BaseMachine
 ): Either<MachineError, void> {
   try {
     eventBus.registerMachine(entityMachine);

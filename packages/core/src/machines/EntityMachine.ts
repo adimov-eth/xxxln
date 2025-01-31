@@ -129,6 +129,7 @@ const executeProposal = (
 // Event-driven entity machine
 export class EntityMachineImpl extends ActorMachine implements EntityMachine {
   public readonly type = 'ENTITY' as const;
+  public readonly inbox: MachineEvent[] = [];
   private _state: EntityState;
   private _version: number;
   public readonly parentId: string;
@@ -289,6 +290,7 @@ export const createEntityMachine = (
   id: string,
   parentId: string,
   config: EntityConfig,
+  eventBus: EventBus,
   initialState: EntityState = createEntityState(config)
 ): Either<MachineError, EntityMachine> => 
   pipe(
@@ -298,7 +300,10 @@ export const createEntityMachine = (
       type: 'ENTITY' as const,
       state: initialState,
       version: 1,
-      parentId
+      parentId,
+      inbox: [],
+      eventBus,
+      handleEvent: async (event: MachineEvent) => right(undefined)
     }))
   );
 

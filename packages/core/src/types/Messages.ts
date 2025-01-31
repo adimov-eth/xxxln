@@ -17,7 +17,7 @@ export type ServerCommand =
   | { type: 'SYNC_STATE'; targetHash: BlockHash }
   | { type: 'SYNC_CHILD_STATES' }
   | { type: 'UPDATE_CHILD_STATE'; childId: MachineId; stateRoot: BlockHash }
-  | { type: 'TRANSFER'; amount: number };
+  | { type: 'TRANSFER'; amount: number; from: string; to: string };
 
 // Signer Messages
 export type SignerCommand =
@@ -64,7 +64,9 @@ export type Event =
   | { type: 'CHANNEL_SETTLED'; channelId: MachineId; finalBalances: Map<MachineId, bigint> }
   | { type: 'DISPUTE_INITIATED'; channelId: MachineId }
   | { type: 'DISPUTE_RESOLVED'; channelId: MachineId }
-  | { type: 'CHILD_STATE_UPDATED'; childId: MachineId; stateRoot: BlockHash };
+  | { type: 'CHILD_STATE_UPDATED'; childId: MachineId; stateRoot: BlockHash }
+  | { type: 'SIGNER_CREATED'; publicKey: PublicKey }
+  | { type: 'TRANSFER_COMPLETED'; from: string; to: string; amount: number };
 
 // Query types
 export type Query =

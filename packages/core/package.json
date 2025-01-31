@@ -17,7 +17,8 @@
     "clean": "rimraf dist",
     "test": "vitest",
     "lint": "eslint src --ext .ts,.tsx",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "demo": "node dist/demo/BasicUsage.js"
   },
   "dependencies": {
     "@noble/bls12-381": "^1.4.0",

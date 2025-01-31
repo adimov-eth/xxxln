@@ -90,8 +90,9 @@ export class MachineRunner {
       const event = this.machine.inbox.shift()!;
 
       try {
+        const result = await this.machine.handleEvent(event);
         await pipe(
-          this.machine.handleEvent(event),
+          result,
           fold(
             error => {
               // Log error

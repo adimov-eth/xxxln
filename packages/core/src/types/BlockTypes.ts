@@ -24,7 +24,7 @@ export interface BlockData {
 export interface Block {
   readonly header: BlockHeader;
   readonly transactions: ReadonlyArray<Message<ServerCommand>>;
-  readonly signatures: ImmutableMap<PublicKey, SignatureData>;
+  readonly signatures: ImmutableMap<string, string>;
 }
 
 // Mempool entry with additional metadata

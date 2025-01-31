@@ -14,14 +14,23 @@ export const createDashboardServer = (port: number): DashboardServer => {
   const io = new Server(httpServer, {
     cors: {
       origin: "http://localhost:5173", // Vite's default port
-      methods: ["GET", "POST"]
+      methods: ["GET", "POST"],
+      credentials: true
     }
+  });
+
+  io.on('connection', (socket) => {
+    console.log('Dashboard client connected');
+    socket.on('disconnect', () => {
+      console.log('Dashboard client disconnected');
+    });
   });
 
   return {
     start: async () => {
       return new Promise((resolve) => {
         httpServer.listen(port, () => {
+          console.log(`Dashboard server listening on port ${port}`);
           resolve();
         });
       });
@@ -30,7 +39,10 @@ export const createDashboardServer = (port: number): DashboardServer => {
     close: async () => {
       return new Promise((resolve) => {
         io.close(() => {
-          httpServer.close(() => resolve());
+          httpServer.close(() => {
+            console.log('Dashboard server closed');
+            resolve();
+          });
         });
       });
     },

@@ -1,5 +1,5 @@
 import { Either, left, right, chain, map } from 'fp-ts/Either';
-import { Map } from 'immutable';
+import { Map as ImmutableMap } from 'immutable';
 import { pipe } from 'fp-ts/function';
 import { createHash } from 'crypto';
 
@@ -9,13 +9,14 @@ import { ServerCommand, Event } from '../types/Messages';
 import { ActorMachine } from '../eventbus/BaseMachine';
 import { EventBus } from '../eventbus/EventBus';
 import { Block, BlockHeader, MempoolEntry, createMempoolState, createBlockProductionConfig, computeTransactionsRoot } from '../types/BlockTypes';
+import { BaseMachine } from '../eventbus/BaseMachine';
 
 // State management
 export const createServerState = (
   blockHeight: number = 0,
   latestHash: BlockHash = '',
-  submachines: Map<string, BlockHash> = Map()
-): ServerState => Map({
+  submachines: ImmutableMap<string, BlockHash> = ImmutableMap()
+): ServerState => ImmutableMap({
   data: {
     blockHeight,
     latestHash,
@@ -28,8 +29,9 @@ export const createServerState = (
 });
 
 // Event-driven server machine
-export class ServerMachineImpl extends ActorMachine implements ServerMachine {
+export class ServerMachineImpl extends ActorMachine implements ServerMachine, BaseMachine {
   public readonly type = 'SERVER' as const;
+  public readonly inbox: MachineEvent[] = [];
   private _state: ServerState;
   private _version: number;
   private _blockProductionInterval?: NodeJS.Timeout;
@@ -244,7 +246,7 @@ export class ServerMachineImpl extends ActorMachine implements ServerMachine {
           const block: Block = {
             header,
             transactions,
-            signatures: Map()
+            signatures: ImmutableMap<string, string>()
           };
 
           // Update state with new block

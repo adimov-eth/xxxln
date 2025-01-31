@@ -22,7 +22,9 @@ export type ErrorCode =
   | 'INVALID_EVENT'
   | 'INVALID_MESSAGE'
   | 'INVALID_OPERATION'
-  | 'VALIDATION_ERROR';
+  | 'VALIDATION_ERROR'
+  | 'INVALID_CONFIG'
+  | 'NETWORK_ERROR';
 
 export type MachineError = {
   readonly code: ErrorCode;
@@ -65,4 +67,12 @@ export type MachineEvent = {
   readonly timestamp: number;
   readonly correlationId?: string;
   readonly causationId?: string;
-}; 
+};
+
+// Log level enum
+export enum LogLevel {
+  DEBUG = 'DEBUG',
+  INFO = 'INFO',
+  WARN = 'WARN',
+  ERROR = 'ERROR'
+} 

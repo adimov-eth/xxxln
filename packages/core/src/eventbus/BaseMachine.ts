@@ -16,7 +16,7 @@ export interface BaseMachine {
   readonly eventBus: EventBus;
 
   // Process an event from the inbox
-  handleEvent(event: MachineEvent): Either<MachineError, void>;
+  handleEvent(event: MachineEvent): Promise<Either<MachineError, void>>;
 }
 
 /**
@@ -26,7 +26,7 @@ export interface BaseMachine {
 export abstract class ActorMachine {
   constructor(
     public readonly id: string,
-    protected readonly eventBus: EventBus
+    public readonly eventBus: EventBus
   ) {}
 
   abstract handleEvent(event: MachineEvent): Promise<Either<MachineError, void>>;
