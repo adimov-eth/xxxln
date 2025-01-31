@@ -1,0 +1,17 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist/
+*.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+
+# Coverage
+coverage/ 

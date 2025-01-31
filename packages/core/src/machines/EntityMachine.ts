@@ -1,9 +1,10 @@
-import { Either, left, right, chain, map, fold } from 'fp-ts/Either';
+import { Either, left, right, chain, map, fold, isLeft } from 'fp-ts/Either';
 import { Map } from 'immutable';
 import { pipe, flow } from 'fp-ts/function';
 import { createHash } from 'crypto';
+import { TaskEither, tryCatch } from 'fp-ts/TaskEither';
 
-import { MachineError, Message, createMachineError } from '../types/Core';
+import { MachineError, Message, createMachineError, MachineEvent, MachineId } from '../types/Core';
 import { 
   EntityMachine, 
   EntityState, 
@@ -14,25 +15,274 @@ import {
   Transaction
 } from '../types/MachineTypes';
 import { EntityCommand, Event } from '../types/Messages';
-import { verifyEntitySignatures } from './SignerMachine';
+import { Proposal, ProposalId, ProposalStatus } from '../types/ProposalTypes';
+import { ActorMachine } from '../eventbus/BaseMachine';
+import { EventBus } from '../eventbus/EventBus';
+import { verifyEcdsaSignature } from '../crypto/EcdsaSignatures';
 
-// State management
+interface EntityStateData {
+  config: EntityConfig;
+  channels: Map<string, BlockHash>;
+  balance: bigint;
+  nonce: number;
+  proposals: Map<ProposalId, Proposal>;
+}
+
+// State management with proposals
 export const createEntityState = (
   config: EntityConfig,
   channels: Map<string, BlockHash> = Map(),
   balance: bigint = BigInt(0),
   nonce: number = 0
-): EntityState => Map<string, {
-  config: EntityConfig;
-  channels: Map<string, BlockHash>;
-  balance: bigint;
-  nonce: number;
-}>().set('data', {
+): EntityState => Map<string, EntityStateData>().set('data', {
   config,
   channels,
   balance,
-  nonce
+  nonce,
+  proposals: Map()
 });
+
+// Helper functions for proposal management
+const createProposal = (
+  proposer: MachineId,
+  type: 'TRANSACTION' | 'CONFIG_UPDATE',
+  transaction?: SignedTransaction,
+  newConfig?: EntityConfig
+): Proposal => ({
+  id: `proposal_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+  proposer,
+  type,
+  transaction,
+  newConfig,
+  approvals: Map<MachineId, boolean>().set(proposer, true),
+  status: 'ACTIVE',
+  timestamp: Date.now(),
+  expiresAt: Date.now() + 24 * 60 * 60 * 1000 // 24 hours expiry
+});
+
+const checkProposalThreshold = (
+  proposal: Proposal,
+  config: EntityConfig
+): { isThresholdMet: boolean; totalWeight: number } => {
+  let totalWeight = 0;
+  
+  // Sum weights of signers who approved
+  for (const [signer, weight] of config.signers) {
+    if (proposal.approvals.get(signer)) {
+      totalWeight += weight;
+    }
+  }
+  
+  return {
+    isThresholdMet: totalWeight >= config.threshold,
+    totalWeight
+  };
+};
+
+const executeProposal = (
+  state: EntityState,
+  proposalId: ProposalId
+): Either<MachineError, EntityState> => {
+  const data = state.get('data') as EntityStateData;
+  if (!data) {
+    return left(createMachineError('INVALID_STATE', 'No entity data'));
+  }
+
+  const proposal = data.proposals.get(proposalId);
+  if (!proposal || proposal.status !== 'ACTIVE') {
+    return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found or not active'));
+  }
+
+  // Mark as executed
+  const updatedProposal = {
+    ...proposal,
+    status: 'EXECUTED' as ProposalStatus
+  };
+
+  let newState = state.set('data', {
+    ...data,
+    proposals: data.proposals.set(proposalId, updatedProposal)
+  });
+
+  // Apply the actual changes
+  switch (proposal.type) {
+    case 'TRANSACTION':
+      if (proposal.transaction) {
+        return processTransaction(newState, proposal.transaction);
+      }
+      break;
+
+    case 'CONFIG_UPDATE':
+      if (proposal.newConfig) {
+        return right(newState.set('data', {
+          ...data,
+          config: proposal.newConfig,
+          nonce: data.nonce + 1
+        }));
+      }
+      break;
+  }
+
+  return right(newState);
+};
+
+// Event-driven entity machine
+export class EntityMachineImpl extends ActorMachine implements EntityMachine {
+  public readonly type = 'ENTITY' as const;
+  private _state: EntityState;
+  private _version: number;
+  public readonly parentId: string;
+
+  constructor(
+    id: string,
+    parentId: string,
+    config: EntityConfig,
+    eventBus: EventBus,
+    initialState: EntityState = createEntityState(config)
+  ) {
+    super(id, eventBus);
+    this.parentId = parentId;
+    this._state = initialState;
+    this._version = 1;
+  }
+
+  // Implement readonly properties
+  get state(): EntityState {
+    return this._state;
+  }
+
+  get version(): number {
+    return this._version;
+  }
+
+  // Handle incoming events
+  async handleEvent(event: MachineEvent): Promise<Either<MachineError, void>> {
+    try {
+      const message = event as Message<EntityCommand>;
+      
+      const commandResult = await processCommand(this, message);
+      if (isLeft(commandResult)) {
+        return commandResult as Either<MachineError, void>;
+      }
+
+      const machine = commandResult.right;
+      this._state = machine.state;
+      this._version = machine.version;
+
+      // Dispatch appropriate events based on command type
+      switch (message.payload.type) {
+        case 'PROPOSE_TRANSACTION': {
+          const proposal = createProposal(
+            message.sender,
+            'TRANSACTION',
+            message.payload.transaction
+          );
+
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'PROPOSAL_CREATED',
+            payload: { 
+              proposalId: proposal.id,
+              proposer: message.sender
+            },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+
+        case 'APPROVE_PROPOSAL': {
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'PROPOSAL_APPROVED',
+            payload: { 
+              proposalId: message.payload.proposalId,
+              approver: message.sender
+            },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+
+        case 'CANCEL_PROPOSAL': {
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'PROPOSAL_CANCELLED',
+            payload: { 
+              proposalId: message.payload.proposalId
+            },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+
+        case 'UPDATE_CONFIG': {
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'CONFIG_UPDATED',
+            payload: { newConfig: message.payload.newConfig },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+
+        case 'OPEN_CHANNEL': {
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'CHANNEL_OPENED',
+            payload: { 
+              channelId: generateChannelId(this.id, message.payload.partnerId),
+              partnerId: message.payload.partnerId
+            },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+
+        case 'CLOSE_CHANNEL': {
+          const outEvent: MachineEvent = {
+            id: `evt_${Date.now()}`,
+            type: 'CHANNEL_CLOSED',
+            payload: { channelId: message.payload.channelId },
+            sender: this.id,
+            target: this.parentId,
+            timestamp: Date.now()
+          };
+          this.eventBus.dispatch(outEvent);
+          break;
+        }
+      }
+
+      return right(undefined);
+    } catch (error) {
+      return left(createMachineError(
+        'INTERNAL_ERROR',
+        'Failed to handle event',
+        error
+      ));
+    }
+  }
+}
+
+// Helper function to generate channel ID
+const generateChannelId = (entityId: string, partnerId: string): string => {
+  const sortedIds = [entityId, partnerId].sort();
+  return `channel_${sortedIds[0]}_${sortedIds[1]}`;
+};
 
 // Entity machine creation
 export const createEntityMachine = (
@@ -133,24 +383,26 @@ const validateEntityState = (state: EntityState): Either<MachineError, void> => 
 };
 
 // Command processing
-export const processCommand = (
+export const processCommand = async (
   machine: EntityMachine,
   message: Message<EntityCommand>
-): Either<MachineError, EntityMachine> =>
-  pipe(
-    validateCommand(machine, message),
-    chain(() => executeCommand(machine, message))
-  );
+): Promise<Either<MachineError, EntityMachine>> => {
+  const validationResult = await validateCommand(machine, message);
+  if (isLeft(validationResult)) {
+    return validationResult as Either<MachineError, EntityMachine>;
+  }
+  return executeCommand(machine, message);
+};
 
 // Command validation
-const validateCommand = (
+const validateCommand = async (
   machine: EntityMachine,
   message: Message<EntityCommand>
-): Either<MachineError, void> => {
+): Promise<Either<MachineError, void>> => {
   try {
     switch (message.payload.type) {
       case 'PROPOSE_TRANSACTION':
-        return validateProposedTransaction(machine, message.payload.transaction);
+        return await validateProposedTransaction(machine, message.payload.transaction);
         
       case 'UPDATE_CONFIG':
         return validateConfigUpdate(machine, message.payload.newConfig);
@@ -174,10 +426,10 @@ const validateCommand = (
 };
 
 // Transaction validation
-const validateProposedTransaction = (
+const validateProposedTransaction = async (
   machine: EntityMachine,
   transaction: SignedTransaction
-): Either<MachineError, void> => {
+): Promise<Either<MachineError, void>> => {
   const data = machine.state.get('data');
   if (!data || typeof data !== 'object') {
     return left(createMachineError(
@@ -200,23 +452,47 @@ const validateProposedTransaction = (
   }
 
   // Verify signatures meet threshold
-  return pipe(
-    verifyEntitySignatures(transaction, config),
-    chain(result => {
-      if (!result.isValid) {
-        return left(createMachineError(
-          'INVALID_OPERATION',
-          'Insufficient valid signatures',
-          { 
-            totalWeight: result.totalWeight,
-            threshold: config.threshold,
-            errors: result.errors
-          }
-        ));
+  const messageHash = computeTransactionHash(transaction);
+  let totalWeight = 0;
+  const errors = Map<string, MachineError>().asMutable();
+
+  // Verify each signature
+  for (const [signer, weight] of config.signers) {
+    const signature = transaction.partialSignatures.get(signer);
+    if (!signature) {
+      errors.set(signer, createMachineError(
+        'INVALID_OPERATION',
+        'Missing signature from signer'
+      ));
+      continue;
+    }
+
+    const result = await verifyEcdsaSignature(messageHash, signature, signer);
+    if (isLeft(result)) {
+      errors.set(signer, result.left);
+    } else if (result.right) {
+      totalWeight += weight;
+    } else {
+      errors.set(signer, createMachineError(
+        'INVALID_OPERATION',
+        'Invalid signature'
+      ));
+    }
+  }
+
+  if (totalWeight < config.threshold) {
+    return left(createMachineError(
+      'INVALID_OPERATION',
+      'Insufficient valid signatures',
+      { 
+        totalWeight,
+        threshold: config.threshold,
+        errors: errors.asImmutable()
       }
-      return right(undefined);
-    })
-  );
+    ));
+  }
+
+  return right(undefined);
 };
 
 // Config update validation
@@ -511,13 +787,16 @@ const verifySignature = (
   message: string,
   signature: string,
   publicKey: string
-): boolean => {
+): Either<MachineError, boolean> => {
   try {
-    // In practice, would use proper crypto
-    // Mock implementation for now
-    return true;
+    const messageBuffer = Buffer.from(message);
+    return verifyEcdsaSignature(messageBuffer, signature, publicKey);
   } catch (error) {
-    return false;
+    return left(createMachineError(
+      'INTERNAL_ERROR',
+      'Failed to verify signature',
+      error
+    ));
   }
 };
 
@@ -527,12 +806,14 @@ const executeCommand = (
   message: Message<EntityCommand>
 ): Either<MachineError, EntityMachine> => {
   try {
-    const newState = processEntityCommand(machine.state, message);
-    return right({
-      ...machine,
-      state: newState,
-      version: machine.version + 1
-    });
+    return pipe(
+      processEntityCommand(machine.state, message),
+      map(newState => ({
+        ...machine,
+        state: newState,
+        version: machine.version + 1
+      }))
+    );
   } catch (error) {
     return left(createMachineError(
       'INTERNAL_ERROR',
@@ -546,22 +827,93 @@ const executeCommand = (
 const processEntityCommand = (
   state: EntityState,
   message: Message<EntityCommand>
-): EntityState => {
+): Either<MachineError, EntityState> => {
+  const data = state.get('data') as EntityStateData;
+  if (!data) {
+    return left(createMachineError('INVALID_STATE', 'No entity data'));
+  }
+
   switch (message.payload.type) {
-    case 'PROPOSE_TRANSACTION':
-      return processTransaction(state, message.payload.transaction);
+    case 'PROPOSE_TRANSACTION': {
+      const proposal = createProposal(
+        message.sender,
+        'TRANSACTION',
+        message.payload.transaction
+      );
+
+      return right(state.set('data', {
+        ...data,
+        proposals: data.proposals.set(proposal.id, proposal)
+      }));
+    }
+
+    case 'APPROVE_PROPOSAL': {
+      const { proposalId } = message.payload;
+      const proposal = data.proposals.get(proposalId);
+
+      if (!proposal || proposal.status !== 'ACTIVE') {
+        return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found or not active'));
+      }
+
+      // Update approvals
+      const updatedProposal = {
+        ...proposal,
+        approvals: proposal.approvals.set(message.sender, true)
+      };
+
+      let newState = state.set('data', {
+        ...data,
+        proposals: data.proposals.set(proposalId, updatedProposal)
+      });
+
+      // Check if threshold is met
+      const { isThresholdMet } = checkProposalThreshold(updatedProposal, data.config);
+      if (isThresholdMet) {
+        return executeProposal(newState, proposalId);
+      }
+
+      return right(newState);
+    }
+
+    case 'CANCEL_PROPOSAL': {
+      const { proposalId } = message.payload;
+      const proposal = data.proposals.get(proposalId);
+
+      if (!proposal || proposal.status !== 'ACTIVE') {
+        return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found or not active'));
+      }
+
+      // Only proposer or admin can cancel
+      if (message.sender !== proposal.proposer && !data.config.admins?.includes(message.sender)) {
+        return left(createMachineError('UNAUTHORIZED', 'Only proposer or admin can cancel'));
+      }
+
+      return right(state.set('data', {
+        ...data,
+        proposals: data.proposals.set(proposalId, {
+          ...proposal,
+          status: 'CANCELLED'
+        })
+      }));
+    }
+
+    case 'UPDATE_CONFIG': {
+      const newState = updateConfig(state, message.payload.newConfig);
+      return right(newState);
+    }
       
-    case 'UPDATE_CONFIG':
-      return updateConfig(state, message.payload.newConfig);
+    case 'OPEN_CHANNEL': {
+      const newState = openChannel(state, message.payload.partnerId);
+      return right(newState);
+    }
       
-    case 'OPEN_CHANNEL':
-      return openChannel(state, message.payload.partnerId);
-      
-    case 'CLOSE_CHANNEL':
-      return closeChannel(state, message.payload.channelId);
+    case 'CLOSE_CHANNEL': {
+      const newState = closeChannel(state, message.payload.channelId);
+      return right(newState);
+    }
       
     default:
-      return state;
+      return right(state);
   }
 };
 
@@ -569,13 +921,11 @@ const processEntityCommand = (
 const processTransaction = (
   state: EntityState,
   transaction: SignedTransaction
-): EntityState => {
-  const data = state.get('data') as {
-    config: EntityConfig;
-    channels: Map<string, BlockHash>;
-    balance: bigint;
-    nonce: number;
-  };
+): Either<MachineError, EntityState> => {
+  const data = state.get('data') as EntityStateData;
+  if (!data) {
+    return left(createMachineError('INVALID_STATE', 'No entity data'));
+  }
 
   // Update nonce
   const newData = {
@@ -587,10 +937,10 @@ const processTransaction = (
   switch (transaction.type) {
     case 'TRANSFER': {
       const amount = (transaction.payload as { amount: bigint }).amount;
-      return state.set('data', {
+      return right(state.set('data', {
         ...newData,
         balance: data.balance - amount
-      });
+      }));
     }
       
     case 'CHANNEL_UPDATE': {
@@ -598,30 +948,30 @@ const processTransaction = (
         channelId: string; 
         newHash: BlockHash 
       };
-      return state.set('data', {
+      return right(state.set('data', {
         ...newData,
         channels: data.channels.set(channelId, newHash)
-      });
+      }));
     }
       
     case 'CONFIG_UPDATE': {
       const newConfig = transaction.payload as EntityConfig;
-      return state.set('data', {
+      return right(state.set('data', {
         ...newData,
         config: newConfig
-      });
+      }));
     }
       
     case 'STATE_UPDATE': {
       const { balance } = transaction.payload as { balance: bigint };
-      return state.set('data', {
+      return right(state.set('data', {
         ...newData,
         balance
-      });
+      }));
     }
       
     default:
-      return state.set('data', newData);
+      return right(state.set('data', newData));
   }
 };
 
@@ -630,13 +980,7 @@ const updateConfig = (
   state: EntityState,
   newConfig: EntityConfig
 ): EntityState => {
-  const data = state.get('data') as {
-    config: EntityConfig;
-    channels: Map<string, BlockHash>;
-    balance: bigint;
-    nonce: number;
-  };
-
+  const data = state.get('data') as EntityStateData;
   return state.set('data', {
     ...data,
     config: newConfig,
@@ -649,13 +993,7 @@ const openChannel = (
   state: EntityState,
   partnerId: string
 ): EntityState => {
-  const data = state.get('data') as {
-    config: EntityConfig;
-    channels: Map<string, BlockHash>;
-    balance: bigint;
-    nonce: number;
-  };
-
+  const data = state.get('data') as EntityStateData;
   return state.set('data', {
     ...data,
     channels: data.channels.set(partnerId, computeInitialChannelHash(partnerId)),
@@ -668,44 +1006,12 @@ const closeChannel = (
   state: EntityState,
   channelId: string
 ): EntityState => {
-  const data = state.get('data') as {
-    config: EntityConfig;
-    channels: Map<string, BlockHash>;
-    balance: bigint;
-    nonce: number;
-  };
-
-  // Get channel state and apply settlement
-  return pipe(
-    getChannelState(channelId),
-    fold(
-      // On error, just remove channel
-      () => state.set('data', {
-        ...data,
-        channels: data.channels.remove(channelId),
-        nonce: data.nonce + 1
-      }),
-      channel => {
-        // Apply settlement if exists and is valid
-        if (channel.settlementProposal?.balances && channel.settlementProposal.balances.has(channelId)) {
-          const myBalance = channel.settlementProposal.balances.get(channelId) as bigint;
-          return state.set('data', {
-            ...data,
-            channels: data.channels.remove(channelId),
-            balance: data.balance + myBalance,
-            nonce: data.nonce + 1
-          });
-        }
-
-        // Otherwise just remove channel
-        return state.set('data', {
-          ...data,
-          channels: data.channels.remove(channelId),
-          nonce: data.nonce + 1
-        });
-      }
-    )
-  );
+  const data = state.get('data') as EntityStateData;
+  return state.set('data', {
+    ...data,
+    channels: data.channels.remove(channelId),
+    nonce: data.nonce + 1
+  });
 };
 
 // Helper functions
@@ -719,14 +1025,70 @@ const computeInitialChannelHash = (partnerId: string): BlockHash => {
 export const generateTransactionEvent = (transaction: Transaction): Event => ({
   type: 'STATE_UPDATED',
   machineId: transaction.sender,
-  version: 1
+  version: 1,
+  stateRoot: createHash('sha256').update(JSON.stringify(transaction)).digest('hex')
 });
 
 export const generateChannelEvent = (
   channelId: string,
   partnerId: string,
-  isOpening: boolean = true
-): Event => ({
-  type: isOpening ? 'CHANNEL_OPENED' : 'CHANNEL_CLOSED',
-  channelId
-}); 
+  isOpening: boolean = true,
+  finalBalances?: Map<MachineId, bigint>
+): Event => 
+  isOpening 
+    ? { type: 'CHANNEL_OPENED' as const, channelId }
+    : { 
+        type: 'CHANNEL_CLOSED' as const, 
+        channelId,
+        finalBalances: finalBalances || Map<MachineId, bigint>()
+      };
+
+// Helper function to apply channel settlement
+const applyChannelSettlement = (
+  state: EntityState,
+  channelId: string,
+  finalBalances: Map<MachineId, bigint>
+): EntityState => {
+  const data = state.get('data') as EntityStateData;
+
+  // Remove channel from tracking
+  const updatedChannels = data.channels.remove(channelId);
+
+  // Apply final balance for this entity
+  const myBalance = finalBalances.get(channelId) || BigInt(0);
+  
+  return state.set('data', {
+    ...data,
+    channels: updatedChannels,
+    balance: data.balance + myBalance,
+    nonce: data.nonce + 1
+  });
+};
+
+// Helper function to compute state hash
+const computeStateHash = (state: EntityState): Either<MachineError, BlockHash> => {
+  try {
+    const stateJson = JSON.stringify(state.toJS());
+    return right(createHash('sha256').update(stateJson).digest('hex'));
+  } catch (error) {
+    return left(createMachineError(
+      'INTERNAL_ERROR',
+      'Failed to compute state hash',
+      error
+    ));
+  }
+};
+
+// Transaction hash computation
+const computeTransactionHash = (transaction: Transaction): Uint8Array => {
+  const hash = createHash('sha256')
+    .update(JSON.stringify({
+      nonce: transaction.nonce,
+      sender: transaction.sender,
+      type: transaction.type,
+      payload: transaction.payload
+    }))
+    .digest();
+    
+  return new Uint8Array(hash);
+}; 

@@ -1,3 +1,109 @@
+Accounts—it's just like, there are accounts, and accounts have storage. If an account is a contract, then everything is in one credit. And then gas-related variables like `gasused`, `gaslimit`—they are not needed here. So, the main ones turn out to be these four variables: the previous block, the transactions that will enter and be applied to the state from the previous block, and the receptions that will come out of it. 
+
+That is, transactions are what go into the blockchain, and we will call this a machine, while receptions are what happened, what the machine responds back. We can rename transactions as "transaction inbox" and receptions as "event outbox" since they are events. But this is the input and output from the supermachine—the one who created and manages it, including the proposer, for example. 
+
+I propose adding a second level of interaction so that these machines can create submachines and communicate with them in the same way through `txoutbox` and `eventinbox`. From this point, we can represent this as squares, ignoring the state because it does not participate—it is just the final hash of what happened as a result. So, we can draw it like this, closing this part, and we get `txinbox`, `txoutbox`, and `event`.
+
+Why should we replace reception with `eventinbox`? It looks exactly like what is described in the actor model I mentioned to you in the forum. What's the name of the pattern again? Ah, it's just called "actors." In short, it's one of the main design patterns. It is an isolated system called an actor, and actors communicate with other actors through events. Inside, there is some kind of machine that can spawn other actors, which also communicate in the same way.
+
+A good example is the browser—when you communicate with another window. You can spawn another window and communicate with it only through events. Inside the window, there is its own state. This is roughly the same thing, but within the blockchain and external systems. Are there also internal and external levels, or is there just one level—incoming and outgoing? Internally, there is always some state. The only difference is the method of transmission. There probably isn't a nonce or any kind of security like that. 
+
+Yes, actors are a more abstract thing—they don't tell you how to implement changes. So, we are left with a square consisting of two inputs and two outputs.
+
+How do transactions look? The same as in Ethereum. They contain the sender, receiver, an increasing nonce, data being transmitted, the method name, and a signature. The signature can be aggregated, consisting of multiple signatures. 
+
+Similarly, the output transactions look the same, except now they are signed by all participants responsible for validation. If one person initiated an input transaction, but the entity consists of five participants, then the output transaction will have five signatures. This happens during the block voting process—when validators return their signature for the proposed block, they simultaneously sign each outgoing transaction. As a result, the proposer has both a signed block and, for example, 10 signed transactions, which can be sent further.
+
+Incoming events come from higher-level submachines because these machines are also launched on the same device. All participants are guaranteed to have the same set of events because they launch all higher-level machines that may send events back. Imagine running three different Ethereum instances on your computer, and if you sync them at approximately the same speed, the events produced by these three instances will aggregate into the same event pool. It's like a mempool but for events coming from above.
+
+Then comes the event processing queue.
+
+---
+
+That means all of these machines are executing the same blockchain, and all have the same event stream, just potentially in a slightly different order. The proposer establishes a definitive event order based on how they received them and distributes this reference order to everyone. 
+
+When transactions are verified, validators check the signatures and nonce increments. For events, they check the synchronization of the submachine up to a specific block number and hash, as well as the corresponding event list. Validators then confirm that these events exist in their own event pool. The events must match, though the order might be different. 
+
+Events execute in the same way as transactions—they can trigger a new transaction upstream or, for example, when an event indicates that funds arrived in a hub, it creates a `txout`. The direction now becomes the next channel to which the funds should be sent. 
+
+Outgoing events can propagate downward to a lower-level signer. The lower the direction, the closer it gets to the root signer machine, which has its own private key and signs blocks instantly. That's how the flow works.
+
+When a signer wants to make a change, they initiate their first transaction. Their machine sends transactions further into multisigs, channels, or depositories. 
+
+The hierarchy grows like this: there is a signer entity, which can create new entities that may form shared multisigs or add channels and depositories. Each entity can also have its own channels and depositories. However, channels and depositories cannot have submachines because they are final—so-called "leaves" in the structure.
+
+Thus, entities interact with each other through channels. If the interaction doesn't work out, they use a shared depository as an intermediary. There are two types of submachines with different purposes: 
+
+1. **Entity submachine** – an organizational submachine that accumulates proposals. Parent or supermachines vote on these proposals. Once a threshold is met, the proposals are executed and trigger:
+   - An event out (to higher levels)
+   - A `txout` (to modify something, like a depository)
+   - Another event out (to modify something at a lower level)
+
+The term **"actor"** is very fitting. I see attempts to build actor-based blockchain models in Scala. This term perfectly matches the system design you created.
+
+---
+
+To summarize the model: 
+
+- **Actors communicate via messages (events)**
+- **Each actor can:**
+  - Make local decisions
+  - Spawn new actors
+  - Send messages to others
+  - Define how to handle subsequent messages
+
+Yes, this does resemble the actor model.
+
+Now, onto implementation:
+
+- A UI communicates with a local node via WebSockets.
+- The node runs a daemon that manages machine consensus.
+- The node provides state data to the UI, such as wallet balance, transaction progress, etc.
+- Nodes execute transactions while tracking signer machines, channels, and depositories.
+
+Hubs act as intermediaries, where users choose a hub based on reputation, collateral, or other factors—similar to choosing a bank. Each hub runs its own signer machine, which facilitates transactions between participants.
+
+---
+
+### Transactions and Events Flow:
+
+1. A transaction is signed and submitted.
+2. It enters a consensus cycle every 100ms.
+3. If the proposer is in charge, they finalize and distribute the signed transaction.
+4. The event moves down to lower machines.
+5. Eventually, the event reaches the final signer, which directly interacts with wallets.
+
+### Depository, Channels, and Entities:
+
+- **Depositories**: Hold locked assets and ensure they are available for transactions.
+- **Channels**: Provide direct state-sharing between two parties, allowing near-instant transactions.
+- **Entities**: More complex multisig-like structures with governance mechanisms.
+
+---
+
+### Payment Process:
+
+1. A user selects a hub and creates a channel.
+2. They deposit assets into the channel via a depository.
+3. The deposit is validated and reflected in their available balance.
+4. Transactions within the channel update shared state (without touching the main chain).
+5. When closing the channel, final balances are settled on-chain.
+
+### Swaps:
+
+- Instead of routing payments, swaps rely on an **order book**.
+- The signer machine holds order data and matches incoming orders.
+- If a match is found, the trade executes without intermediaries.
+
+
+
+
+
+
+
+Short version:
+
+
 # Blockchain Architecture Discussion
 
 ## Core Components
@@ -75,10 +181,12 @@
 ## Machine Types
 
 ### Entity Types
-- Signer entities
+- signers
+— entities
 - Channels
 - Depositories
-- Leaf nodes (channels/depositories) cannot have sub-machines
+
+Leaf nodes (channels/depositories) cannot have sub-machines
 
 ### Communication Pattern
 - Entities can interact through channels

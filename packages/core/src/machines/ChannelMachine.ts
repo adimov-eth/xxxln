@@ -3,7 +3,7 @@ import { Map } from 'immutable';
 import { pipe } from 'fp-ts/function';
 import { createHash } from 'crypto';
 
-import { MachineError, Message, createMachineError, MachineId } from '../types/Core';
+import { MachineError, Message, createMachineError, MachineId, MachineEvent } from '../types/Core';
 import { 
   ChannelMachine, 
   ChannelState,
@@ -15,6 +15,9 @@ import {
   DisputeState
 } from '../types/MachineTypes';
 import { ChannelCommand } from '../types/Messages';
+import { ActorMachine } from '../eventbus/BaseMachine';
+import { EventBus } from '../eventbus/EventBus';
+import { verifyEcdsaSignature } from '../crypto/EcdsaSignatures';
 
 // State types
 type DisputeStatus = 
@@ -139,13 +142,16 @@ const verifySignature = (
   message: string,
   signature: SignatureData,
   publicKey: MachineId
-): boolean => {
+): Either<MachineError, boolean> => {
   try {
-    // In practice, would use proper crypto (e.g., secp256k1)
-    // Mock implementation for now
-    return true;
+    const messageBuffer = Buffer.from(message);
+    return verifyEcdsaSignature(messageBuffer, signature, publicKey);
   } catch (error) {
-    return false;
+    return left(createMachineError(
+      'INTERNAL_ERROR',
+      'Failed to verify signature',
+      error
+    ));
   }
 };
 
@@ -518,14 +524,34 @@ const processChannelCommand = (
           return state;
         }
 
-        // Apply latest state and clear dispute
-        return state.set('data', {
+        // Apply latest state and mark dispute as resolved
+        const resolvedState = state.set('data', {
           ...data,
-          dispute: undefined,
+          dispute: {
+            ...data.dispute,
+            status: 'RESOLVED',
+            evidence: updatedEvidence
+          },
           balances: latestUpdate.balances,
           sequence: latestUpdate.sequence,
           stateUpdates: data.stateUpdates.set(latestUpdate.sequence, latestUpdate)
         });
+
+        // Automatically trigger settlement finalization
+        return processChannelCommand(
+          resolvedState,
+          {
+            id: `settle_${Date.now()}`,
+            type: 'FINALIZE_SETTLEMENT',
+            payload: {
+              type: 'FINALIZE_SETTLEMENT',
+              finalBalances: latestUpdate.balances
+            },
+            sender: message.sender,
+            recipient: message.recipient,
+            timestamp: Date.now()
+          }
+        );
       }
 
       // Update dispute with new evidence
@@ -536,6 +562,50 @@ const processChannelCommand = (
           evidence: updatedEvidence,
           status: 'EVIDENCE_SUBMITTED'
         },
+        sequence: data.sequence + 1
+      });
+    }
+
+    case 'FINALIZE_SETTLEMENT': {
+      // Apply final balances and prepare for closure
+      const finalBalances = message.payload.finalBalances;
+      
+      // Verify all participants are accounted for
+      if (!data.participants.every(p => finalBalances.has(p))) {
+        return state;
+      }
+
+      // Verify total balance remains unchanged
+      const currentTotal = Array.from(data.balances.values())
+        .reduce((sum, balance) => sum + balance, BigInt(0));
+      const finalTotal = Array.from(finalBalances.values())
+        .reduce((sum, balance) => sum + balance, BigInt(0));
+      
+      if (currentTotal !== finalTotal) {
+        return state;
+      }
+
+      return state.set('data', {
+        ...data,
+        balances: finalBalances,
+        dispute: undefined,
+        sequence: data.sequence + 1
+      });
+    }
+
+    case 'CLOSE_CHANNEL': {
+      // Only allow closure if:
+      // 1. No active dispute (or dispute is resolved)
+      // 2. Both participants have agreed (via signatures)
+      // 3. Or if there's a finalized settlement
+      if (data.dispute && data.dispute.status !== 'RESOLVED') {
+        return state;
+      }
+
+      return state.set('data', {
+        ...data,
+        isOpen: false,
+        dispute: undefined,
         sequence: data.sequence + 1
       });
     }
@@ -622,4 +692,51 @@ const applyPenalties = (
   }
 
   return newBalances;
-}; 
+};
+
+// Event-driven channel machine
+export class ChannelMachineImpl extends ActorMachine implements ChannelMachine {
+  public readonly type = 'CHANNEL' as const;
+  private _state: ChannelState;
+  private _version: number;
+  public readonly parentIds: [MachineId, MachineId];
+
+  constructor(
+    id: string,
+    parentIds: [MachineId, MachineId],
+    eventBus: EventBus,
+    initialState: ChannelState
+  ) {
+    super(id, eventBus);
+    this.parentIds = parentIds;
+    this._state = initialState;
+    this._version = 1;
+  }
+
+  // Implement readonly properties
+  get state(): ChannelState {
+    return this._state;
+  }
+
+  get version(): number {
+    return this._version;
+  }
+
+  // Handle incoming events
+  async handleEvent(event: MachineEvent): Promise<Either<MachineError, void>> {
+    try {
+      const message = event as Message<ChannelCommand>;
+      const result = await processCommand(this, message);
+      return pipe(
+        result,
+        map(() => undefined)
+      );
+    } catch (error) {
+      return left(createMachineError(
+        'INTERNAL_ERROR',
+        'Failed to handle event',
+        error
+      ));
+    }
+  }
+} 

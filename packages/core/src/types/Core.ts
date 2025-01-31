@@ -3,13 +3,26 @@ import { Map } from 'immutable';
 // Basic types
 export type MachineId = string;
 
+// Base Machine interface
+export interface Machine {
+  readonly id: MachineId;
+  readonly type: string;
+  readonly state: Map<string, unknown>;
+  readonly version: number;
+}
+
 // Error handling
 export type ErrorCode = 
+  | 'INTERNAL_ERROR'
   | 'INVALID_STATE'
+  | 'INVALID_SIGNATURE'
+  | 'INVALID_PROPOSAL'
+  | 'UNAUTHORIZED'
+  | 'INVALID_COMMAND'
+  | 'INVALID_EVENT'
   | 'INVALID_MESSAGE'
   | 'INVALID_OPERATION'
-  | 'VALIDATION_ERROR'
-  | 'INTERNAL_ERROR';
+  | 'VALIDATION_ERROR';
 
 export type MachineError = {
   readonly code: ErrorCode;
@@ -38,6 +51,18 @@ export type Message<T = unknown> = {
   readonly timestamp: number;
   readonly sender: MachineId;
   readonly recipient: MachineId;
+  readonly correlationId?: string;
+  readonly causationId?: string;
+};
+
+// Event types
+export type MachineEvent = {
+  readonly id: string;
+  readonly type: string;
+  readonly payload: unknown;
+  readonly sender?: MachineId;
+  readonly target?: MachineId;
+  readonly timestamp: number;
   readonly correlationId?: string;
   readonly causationId?: string;
 }; 

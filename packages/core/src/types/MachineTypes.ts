@@ -1,5 +1,6 @@
 import { Map } from 'immutable';
 import { Machine, MachineId, State } from './Core';
+import { MempoolState, BlockProductionConfig } from './BlockTypes';
 
 // Common types for all machines
 export type BlockHash = string;
@@ -31,16 +32,33 @@ export type Transaction = {
   readonly metadata: TransactionMetadata;
 };
 
-export type SignedTransaction = Transaction & {
-  readonly signatures: Map<PublicKey, SignatureData>;
-  readonly recoveryParams: Map<PublicKey, number>; // For ECDSA signature recovery
-};
+export interface SignedTransaction extends Transaction {
+  // Basic fields inherited from Transaction
+  
+  // Store partial signatures from each signer
+  partialSignatures: Map<PublicKey, string>; // BLS partial signatures
+  
+  // The final aggregated signature
+  aggregatedSignature?: string;
+  
+  // Track which signers contributed
+  aggregatedSigners?: Array<PublicKey>;
+}
+
+// Add BLS specific types
+export type BlsSignature = string;
+export type BlsPublicKey = string;
+export type BlsPrivateKey = string;
 
 // Server Machine Types
 export type ServerStateData = {
   readonly blockHeight: number;
   readonly latestHash: BlockHash;
   readonly submachines: Map<MachineId, BlockHash>;
+  readonly mempool: MempoolState;
+  readonly blockProductionConfig: BlockProductionConfig;
+  readonly lastBlockTime: number;
+  readonly lastSyncTime: number;
 };
 
 export type ServerState = Map<string, ServerStateData>;
@@ -51,12 +69,12 @@ export type ServerMachine = Machine & {
 };
 
 // Signer Machine Types
-export type SignerStateData = {
-  readonly publicKey: PublicKey;
-  readonly entities: Map<MachineId, BlockHash>;
+export interface SignerStateData {
+  readonly publicKey: string;
+  readonly privateKey: string;
+  readonly pendingTransactions: Map<string, SignedTransaction>;
   readonly nonce: number;
-  readonly pendingTransactions: Map<string, SignedTransaction>; // txHash -> SignedTransaction
-};
+}
 
 export type SignerState = Map<string, SignerStateData>;
 
@@ -67,10 +85,11 @@ export type SignerMachine = Machine & {
 };
 
 // Entity Machine Types
-export type EntityConfig = {
-  readonly threshold: number;
-  readonly signers: Map<PublicKey, number>; // signer -> weight
-};
+export interface EntityConfig {
+  threshold: number;
+  signers: Map<string, number>; // signer -> weight
+  admins?: string[];
+}
 
 export type EntityState = State & Map<string, {
   readonly config: EntityConfig;

@@ -1,3 +1,37 @@
+Implement Two-Tier Proposals in EntityMachine
+
+Add a proposal object/queue rather than applying transactions immediately.
+Only finalize (execute) proposals once threshold signatures are reached.
+Add Aggregated Signature Flow
+
+Expand from individual secp256k1 signatures to a single combined/aggregated signature object.
+Store partial signatures and merge them into one final signature for outgoing transactions or blocks.
+Refine Event-Driven Architecture
+
+Replace direct processCommand() calls with an event/message queue for each machine (“actor”).
+Generate events (e.g., EVENT_OUTBOX) whenever a submachine updates state, and propagate them up/down the hierarchy.
+Enhance Block Production on ServerMachine
+
+Maintain a mempool (transaction inbox) and produce blocks at regular intervals (e.g., every 100ms).
+Each block references the previous block hash, includes the signed transactions, and is stored in an on-disk or in-memory DB.
+Synchronize Child Machine States
+
+Ensure that Entity and Channel updates are stored/referenced in the ServerMachine’s state root or block hash (for a full hierarchical state proof).
+Complete Dispute/Settlement Paths
+
+Flesh out the ChannelMachine dispute logic to fully handle closing a channel on the parent chain (e.g., EntityMachine), applying final balances, and reflecting that in the global state.
+Security & Authorization
+
+Replace mock cryptographic checks (e.g., in ChannelMachine) with real ECDSA or BLS signature verification.
+Optionally store private keys securely for SignerMachine rather than deriving from a hashed public key.
+Improve Networking Protocol
+
+Add specialized P2P messages for block/state requests and responses (e.g., REQUEST_BLOCK, RESPONSE_BLOCK).
+Implement node discovery and peer liveness checks (beyond the current PING/PONG).
+
+
+
+
 # Initial Prototype Plan
 
 ## Phase 1: Core Machine Types [ ]

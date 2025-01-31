@@ -1,421 +1,311 @@
-// Types
-type Address = string
-type Hash = string
-type Signature = string
-type Timestamp = number
+const level = require('level')
 
-// Core types as readonly
-type Transaction = Readonly<{
-    id: string
-    nonce: number
-    sender: Address
-    command: string
-    data: any
-    signature: Signature
-    timestamp: Timestamp
-}>
-
-type Event = Readonly<{
-    id: string
-    type: string
-    data: any
-    source: Address
-    timestamp: Timestamp
-}>
-
-type Vote = Readonly<{
-    proposalId: string
-    voterAddress: Address
-    nonce: number
-    weight: number
-    signature: Signature
-    timestamp: Timestamp
-}>
-
-type Proposal = Readonly<{
-    id: string
-    nonce: number
-    creator: Address
-    transaction: Transaction
-    baseState: {
-        readonly stateRoot: Hash
-        readonly blockHeight: number
-    }
-    votes: Readonly<Record<Address, Vote>>
-    threshold: number
-    status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED'
-    expiresAt: Timestamp
-    timestamp: Timestamp
-}>
-
-type Block = Readonly<{
-    height: number
-    timestamp: Timestamp
-    prevHash: Hash
-    transactions: readonly Transaction[]
-    events: readonly Event[]
-    proposals: Readonly<{
-        approved: readonly Proposal[]
-        rejected: readonly Proposal[]
-        expired: readonly Proposal[]
-    }>
-    stateRoot: Hash
-    merkleRoot: Hash
-    signatures: Readonly<Record<Address, Signature>>
-}>
-
-type State = Readonly<{
-    blockHeight: number
-    stateRoot: Hash
-    data: Readonly<Record<string, any>>
-    nonces: Readonly<Record<Address, number>>
-}>
-
-type HSTM = Readonly<{
-    id: string
-    address: Address
-    parentMachine: string | null
-    childMachines: readonly string[]
-    state: State
-    blocks: readonly Block[]
-    mempool: Readonly<{
-        transactions: readonly Transaction[]
-        proposals: Readonly<Record<string, Proposal>>
-    }>
-    messageChannels: Readonly<{
-        txIn: readonly Transaction[]
-        txOut: readonly Transaction[]
-        eventIn: readonly Event[]
-        eventOut: readonly Event[]
-    }>
-}>
-
-// Pure functions for state transitions
-const createHSTM = (config: {
-    id: string
-    address: Address
-    parentMachine?: string
-    initialState?: State
-}): HSTM => ({
-    id: config.id,
-    address: config.address,
-    parentMachine: config.parentMachine || null,
-    childMachines: [],
-    state: config.initialState || {
-        blockHeight: 0,
-        stateRoot: '',
-        data: {},
-        nonces: {}
-    },
-    blocks: [],
-    mempool: {
-        transactions: [],
-        proposals: {}
-    },
-    messageChannels: {
-        txIn: [],
-        txOut: [],
-        eventIn: [],
-        eventOut: []
-    }
+// -------------------- Core Types --------------------
+const createBlock = (prevHash, transactions, stateHash) => ({
+  prevHash,
+  transactions,
+  stateHash,
+  timestamp: Date.now()
 })
 
-// State transitions
-const transition = (hstm: HSTM, newState: Partial<State>): HSTM => ({
-    ...hstm,
-    state: {
-        ...hstm.state,
-        ...newState,
-        stateRoot: computeStateRoot({ ...hstm.state, ...newState })
-    }
+/**
+ * Our main "chain state" object:
+ *  - blockHeight: current chain height
+ *  - submachines: Map of submachineId -> { rootHash, data }
+ *  - latestHash: hash of the latest block
+ */
+const createState = (blockHeight = 0, submachines = new Map(), latestHash = '') => ({
+  blockHeight,
+  submachines,
+  latestHash
 })
 
-// Block creation
-const createBlock = (hstm: HSTM): [HSTM, Block] => {
-    const block: Block = {
-        height: hstm.state.blockHeight + 1,
-        timestamp: Date.now(),
-        prevHash: hstm.blocks[hstm.blocks.length - 1]?.stateRoot || '',
-        transactions: hstm.mempool.transactions,
-        events: [],
-        proposals: {
-            approved: [],
-            rejected: [],
-            expired: []
-        },
-        stateRoot: computeStateRoot(hstm.state),
-        merkleRoot: computeMerkleRoot(hstm.mempool.transactions),
-        signatures: {
-            [hstm.address]: sign(hstm.address, computeMerkleRoot(hstm.mempool.transactions))
-        }
-    }
-
-    return [
-        {
-            ...hstm,
-            blocks: [...hstm.blocks, block],
-            mempool: {
-                transactions: [],
-                proposals: {}
-            }
-        },
-        block
-    ]
+/**
+ * Minimal "RLP" helpers for demonstration.
+ * In practice, you'd want a real RLP library.
+ */
+const encodeRLP = (input) => {
+  if (typeof input === 'string') {
+    return Buffer.from(input, 'hex')
+  }
+  if (Array.isArray(input)) {
+    return Buffer.concat(input.map(encodeRLP))
+  }
+  return Buffer.from(String(input))
 }
 
-// Proposal management
-const createProposal = (
-    hstm: HSTM,
-    transaction: Transaction
-): [HSTM, Proposal] => {
-    const proposal: Proposal = {
-        id: generateId(),
-        nonce: getNonce(hstm.state, hstm.address),
-        creator: hstm.address,
-        transaction,
-        baseState: {
-            stateRoot: hstm.state.stateRoot,
-            blockHeight: hstm.state.blockHeight
-        },
-        votes: {},
-        threshold: getThreshold(hstm),
-        status: 'PENDING',
-        expiresAt: Date.now() + 3600000,
-        timestamp: Date.now()
-    }
+const decodeRLP = (buffer) => buffer.toString('hex')
 
-    return [
-        {
-            ...hstm,
-            mempool: {
-                ...hstm.mempool,
-                proposals: {
-                    ...hstm.mempool.proposals,
-                    [proposal.id]: proposal
-                }
-            }
-        },
-        proposal
-    ]
+// -------------------- State Management --------------------
+/**
+ * Update a single submachine's state object in our global chain state.
+ * We'll store an object: { rootHash, data } for each submachine.
+ */
+const updateSubmachineState = (state, submachineId, newRootHash, newData) => {
+  const updatedValue = { rootHash: newRootHash, data: newData }
+  const newMap = new Map(state.submachines)
+  newMap.set(submachineId, updatedValue)
+
+  return {
+    ...state,
+    submachines: newMap
+  }
 }
 
-const addVote = (
-    hstm: HSTM,
-    proposalId: string,
-    vote: Vote
-): [HSTM, Proposal] => {
-    const proposal = hstm.mempool.proposals[proposalId]
-    if (!proposal) throw new Error('Proposal not found')
+/**
+ * Compute a naive "stateHash" by just hashing (JSON-encoding) the state object.
+ */
+const computeStateHash = (state) => {
+  // Convert submachines Map to a plain object for JSON.
+  const submachineObj = {}
+  for (const [k, v] of state.submachines.entries()) {
+    submachineObj[k] = v
+  }
 
-    const updatedProposal: Proposal = {
-        ...proposal,
-        votes: {
-            ...proposal.votes,
-            [vote.voterAddress]: vote
-        }
-    }
+  const stateObj = {
+    blockHeight: state.blockHeight,
+    submachines: submachineObj,
+    latestHash: state.latestHash
+  }
 
-    const [updatedHSTM, finalProposal] = checkProposalStatus(
-        {
-            ...hstm,
-            mempool: {
-                ...hstm.mempool,
-                proposals: {
-                    ...hstm.mempool.proposals,
-                    [proposalId]: updatedProposal
-                }
-            }
-        },
-        proposalId
-    )
-
-    return [updatedHSTM, finalProposal]
+  // A toy "hash"—stringify + hex-encode the JSON.
+  return Buffer.from(JSON.stringify(stateObj)).toString('hex')
 }
 
-// Message processing
-const processMessages = (hstm: HSTM): HSTM => {
-    const withProcessedTx = processTxIn(hstm)
-    const withProcessedEvents = processEventIn(withProcessedTx)
-    return cleanupMempool(withProcessedEvents)
-}
+// -------------------- Mempool --------------------
+const createMempool = () => ({
+  transactions: [],
+  keyedTransactions: new Map() // submachineId -> transactions
+})
 
-const processTxIn = (hstm: HSTM): HSTM => {
-    const validTxs = hstm.messageChannels.txIn.filter(verifyTransaction)
-    
+const addToMempool = (mempool, transaction) => {
+  // If a transaction targets a specific submachine, store separately:
+  if (transaction.submachineId) {
+    const existing = mempool.keyedTransactions.get(transaction.submachineId) || []
+    const newKeyedMap = new Map(mempool.keyedTransactions)
+    newKeyedMap.set(transaction.submachineId, [...existing, transaction])
     return {
-        ...hstm,
-        mempool: {
-            ...hstm.mempool,
-            transactions: [...hstm.mempool.transactions, ...validTxs]
-        },
-        messageChannels: {
-            ...hstm.messageChannels,
-            txIn: []
-        }
+      ...mempool,
+      keyedTransactions: newKeyedMap
     }
+  }
+  // Otherwise, it's a top-level transaction
+  return {
+    ...mempool,
+    transactions: [...mempool.transactions, transaction]
+  }
 }
 
-const processEventIn = (hstm: HSTM): HSTM => {
-    const processedEvents = hstm.messageChannels.eventIn.reduce(
-        handleEvent,
-        hstm
-    )
+const clearMempool = () => createMempool()
 
-    return {
-        ...processedEvents,
-        messageChannels: {
-            ...processedEvents.messageChannels,
-            eventIn: []
+// -------------------- Block Production --------------------
+/**
+ * Produce a new block from the current mempool, apply all transactions
+ * to modify the state, and store the result in LevelDB.
+ */
+const produceBlock = async (state, mempool, db) => {
+  // Collect all transactions
+  const transactions = [
+    ...mempool.transactions,
+    ...Array.from(mempool.keyedTransactions.values()).flat()
+  ]
+
+  // Process transactions and compute new state
+  let newState = { ...state }
+
+  transactions.forEach((tx) => {
+    // If it's a submachine update with arbitrary rootHash:
+    if (tx.type === 'SUBMACHINE_UPDATE') {
+      const existingSub = newState.submachines.get(tx.submachineId) || { rootHash: '', data: {} }
+      newState = updateSubmachineState(
+        newState,
+        tx.submachineId,
+        tx.newRootHash,
+        {
+          ...existingSub.data,
+          // store the entire tx.data if you want or merge as needed
+          ...tx.data
         }
+      )
     }
+
+    // If it's specifically a "counter increment" transaction:
+    if (tx.type === 'COUNTER_INCREMENT') {
+      // Grab the existing submachine or create a new one
+      const existingSub = newState.submachines.get(tx.submachineId) || {
+        rootHash: '0x0',
+        data: { counter: 0 }
+      }
+      const oldCounter = existingSub.data.counter || 0
+      const newCounter = oldCounter + tx.amount
+
+      // Recompute rootHash if you like
+      const newRootHash = '0x' + newCounter.toString(16)
+
+      newState = updateSubmachineState(
+        newState,
+        tx.submachineId,
+        newRootHash,
+        {
+          ...existingSub.data,
+          counter: newCounter
+        }
+      )
+    }
+  })
+
+  // Bump the block height
+  newState.blockHeight += 1
+
+  // Construct the block with the final stateHash
+  const stateHash = computeStateHash(newState)
+  const block = createBlock(state.latestHash, transactions, stateHash)
+  const blockHash = computeStateHash(block)
+
+  // Update latestHash on the new state
+  newState.latestHash = blockHash
+
+  // Store block and state in LevelDB
+  await db.put(`block:${blockHash}`, JSON.stringify(block))
+  await db.put(`state:${blockHash}`, JSON.stringify(newState))
+
+  return { block, newState }
 }
 
-// Helper functions
-const checkProposalStatus = (
-    hstm: HSTM,
-    proposalId: string
-): [HSTM, Proposal] => {
-    const proposal = hstm.mempool.proposals[proposalId]
-    if (!proposal) throw new Error('Proposal not found')
+// -------------------- Server Implementation --------------------
+const createServer = (db) => {
+  let currentState = createState()
+  let currentMempool = createMempool()
 
-    const totalWeight = Object.values(proposal.votes)
-        .reduce((sum, vote) => sum + vote.weight, 0)
+  // Accept an incoming transaction and add it to the mempool
+  const processTransaction = async (tx) => {
+    currentMempool = addToMempool(currentMempool, tx)
+  }
 
-    if (totalWeight >= proposal.threshold) {
-        const approvedProposal = {
-            ...proposal,
-            status: 'APPROVED' as const
-        }
+  // Manual way to force a block production if desired
+  const produceNextBlock = async () => {
+    const { block, newState } = await produceBlock(currentState, currentMempool, db)
+    currentState = newState
+    currentMempool = clearMempool()
+    return block
+  }
 
-        return [
+  // Automatically produce blocks every 100ms
+  const start = () => {
+    setInterval(async () => {
+      await produceNextBlock()
+    }, 100)
+  }
+
+  return {
+    processTransaction,
+    produceNextBlock,
+    getCurrentState: () => currentState,
+    start
+  }
+}
+
+// -------------------- Example Usage --------------------
+const initializeSystem = async () => {
+  const db = level('./chaindb') // Persist data in ./chaindb directory
+  const server = createServer(db)
+
+  // Example transaction: generic SUBMACHINE_UPDATE
+  await server.processTransaction({
+    type: 'SUBMACHINE_UPDATE',
+    submachineId: '0xABC',
+    newRootHash: '0x1234',
+    data: { info: 'Hello world' }
+  })
+
+  // Start block production (every 100ms)
+  server.start()
+
+  // State reconstruction: from a target block hash, walk backwards
+  const reconstructState = async (targetBlockHash) => {
+    let state = createState()
+    let currentHash = targetBlockHash
+
+    while (currentHash) {
+      const blockData = await db.get(`block:${currentHash}`).catch(() => null)
+      if (!blockData) break
+
+      const block = JSON.parse(blockData)
+
+      // Re-apply all transactions from this block to "rebuild" the state
+      block.transactions.forEach((tx) => {
+        if (tx.type === 'SUBMACHINE_UPDATE') {
+          const existing = state.submachines.get(tx.submachineId) || { rootHash: '', data: {} }
+          state = updateSubmachineState(
+            state,
+            tx.submachineId,
+            tx.newRootHash,
             {
-                ...hstm,
-                mempool: {
-                    transactions: [...hstm.mempool.transactions, proposal.transaction],
-                    proposals: omit(hstm.mempool.proposals, proposalId)
-                }
-            },
-            approvedProposal
-        ]
-    }
-
-    return [hstm, proposal]
-}
-
-const cleanupMempool = (hstm: HSTM): HSTM => {
-    const now = Date.now()
-    const [expiredProposals, validProposals] = partition(
-        Object.entries(hstm.mempool.proposals),
-        ([_, proposal]) => now > proposal.expiresAt
-    )
-
-    return {
-        ...hstm,
-        mempool: {
-            ...hstm.mempool,
-            proposals: Object.fromEntries(validProposals)
-        }
-    }
-}
-
-// Pure utility functions
-const getNonce = (state: State, address: Address): number => 
-    (state.nonces[address] || 0) + 1
-
-const getThreshold = (hstm: HSTM): number => 7 // Implementation specific
-
-const computeStateRoot = (state: State): Hash => 
-    hash(JSON.stringify(state))
-
-const computeMerkleRoot = (data: any): Hash =>
-    hash(JSON.stringify(data))
-
-const verifyTransaction = (tx: Transaction): boolean =>
-    true // Implementation specific
-
-const handleEvent = (hstm: HSTM, event: Event): HSTM =>
-    hstm // Implementation specific
-
-const sign = (address: Address, data: any): Signature =>
-    '' // Implementation specific
-
-const generateId = (): string =>
-    Math.random().toString(36).substring(7)
-
-const hash = (data: string): Hash =>
-    data // Implementation specific
-
-// Utility functions for immutable operations
-const omit = <T extends object, K extends keyof T>(
-    obj: T,
-    key: K
-): Omit<T, K> => {
-    const { [key]: _, ...rest } = obj
-    return rest
-}
-
-const partition = <T>(
-    arr: T[],
-    predicate: (item: T) => boolean
-): [T[], T[]] => {
-    const passes: T[] = []
-    const fails: T[] = []
-    arr.forEach(item => {
-        if (predicate(item)) {
-            passes.push(item)
-        } else {
-            fails.push(item)
-        }
-    })
-    return [passes, fails]
-}
-
-// API functions - these compose the pure functions above
-const submitTransaction = (
-    hstm: HSTM,
-    tx: Transaction
-): HSTM =>
-    verifyTransaction(tx)
-        ? {
-            ...hstm,
-            messageChannels: {
-                ...hstm.messageChannels,
-                txIn: [...hstm.messageChannels.txIn, tx]
+              ...existing.data,
+              ...tx.data
             }
+          )
         }
-        : hstm
+        if (tx.type === 'COUNTER_INCREMENT') {
+          const existing = state.submachines.get(tx.submachineId) || {
+            rootHash: '0x0',
+            data: { counter: 0 }
+          }
+          const oldCounter = existing.data.counter || 0
+          const newCounter = oldCounter + tx.amount
+          const newRootHash = '0x' + newCounter.toString(16)
+          state = updateSubmachineState(state, tx.submachineId, newRootHash, {
+            ...existing.data,
+            counter: newCounter
+          })
+        }
+      })
 
-const submitProposal = (
-    hstm: HSTM,
-    tx: Transaction
-): [HSTM, Proposal] =>
-    createProposal(hstm, tx)
+      // Move to the previous block
+      currentHash = block.prevHash
+    }
+    return state
+  }
 
-const submitVote = (
-    hstm: HSTM,
-    proposalId: string,
-    vote: Vote
-): [HSTM, Proposal] =>
-    addVote(hstm, proposalId, vote)
-
-export {
-    // Types
-    HSTM,
-    Block,
-    Transaction,
-    Proposal,
-    Vote,
-    Event,
-    State,
-    
-    // Core functions
-    createHSTM,
-    transition,
-    createBlock,
-    processMessages,
-    
-    // API functions
-    submitTransaction,
-    submitProposal,
-    submitVote
+  return { server, db, reconstructState }
 }
+
+// -------------------- Testing Helpers --------------------
+/**
+ * Create a "COUNTER_INCREMENT" transaction for a given submachine ID.
+ * This increments the submachine's counter by `amount`.
+ */
+const createCounterTx = (submachineId, amount) => ({
+  type: 'COUNTER_INCREMENT',
+  submachineId,
+  amount
+})
+
+// -------------------- Example Test Flow --------------------
+const runTest = async () => {
+  const { server, reconstructState } = await initializeSystem()
+
+  // Submit several "COUNTER_INCREMENT" transactions
+  for (let i = 1; i <= 5; i++) {
+    await server.processTransaction(createCounterTx('0xCOUNTER', 2))
+  }
+
+  // Wait some milliseconds so a few blocks are produced
+  await new Promise((resolve) => setTimeout(resolve, 700))
+
+  // Check current server state
+  const currentState = server.getCurrentState()
+  console.log('--- Current Chain State ---')
+  console.log(currentState)
+
+  // The submachine with ID '0xCOUNTER' should have a counter of 10 (5 increments * 2 each).
+  const subData = currentState.submachines.get('0xCOUNTER')
+  console.log('Counter submachine data:', subData)
+
+  // Reconstruct the state from the chain
+  const rebuiltState = await reconstructState(currentState.latestHash)
+  console.log('--- Reconstructed State ---')
+  console.log(rebuiltState.submachines.get('0xCOUNTER'))
+}
+
+runTest().catch(console.error)

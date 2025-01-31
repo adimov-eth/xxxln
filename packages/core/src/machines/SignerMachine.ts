@@ -1,11 +1,9 @@
-import { Either, left, right, chain, map } from 'fp-ts/Either';
+import { Either, left, right, chain, map, isLeft, fold } from 'fp-ts/Either';
 import { Map } from 'immutable';
 import { pipe } from 'fp-ts/function';
 import { createHash } from 'crypto';
-import { createPrivateKey, createPublicKey, sign, KeyObject } from 'crypto';
-import { ec as EC } from 'elliptic';
 
-import { MachineError, Message, createMachineError } from '../types/Core';
+import { MachineError, Message, createMachineError, MachineEvent } from '../types/Core';
 import { 
   SignerMachine, 
   SignerState, 
@@ -17,41 +15,83 @@ import {
   SignedTransaction
 } from '../types/MachineTypes';
 import { SignerCommand, Event } from '../types/Messages';
-
-// Initialize secp256k1 curve
-const secp256k1 = new EC('secp256k1');
+import { ActorMachine } from '../eventbus/BaseMachine';
+import { EventBus } from '../eventbus/EventBus';
+import { getKeyStorage } from '../crypto/KeyStorage';
+import { createEcdsaSignature, verifyEcdsaSignature } from '../crypto/EcdsaSignatures';
 
 // State management
 export const createSignerState = (
   publicKey: PublicKey,
-  entities: Map<string, BlockHash> = Map(),
-  nonce: number = 0
-): SignerState => Map({
-  data: {
-    publicKey,
-    entities,
-    nonce,
-    pendingTransactions: Map<string, SignedTransaction>()
-  }
+): SignerState => Map<string, SignerStateData>().set('data', {
+  publicKey,
+  privateKey: '', // This is now managed by KeyStorage
+  pendingTransactions: Map<string, SignedTransaction>(),
+  nonce: 0
 });
 
-// Signer machine creation
-export const createSignerMachine = (
-  id: string,
-  parentId: string,
-  publicKey: PublicKey,
-  initialState: SignerState = createSignerState(publicKey)
-): Either<MachineError, SignerMachine> => 
-  pipe(
-    validateSignerState(initialState),
-    map(() => ({
-      id,
-      type: 'SIGNER' as const,
-      state: initialState,
-      version: 1,
-      parentId
-    }))
-  );
+// Event-driven signer machine
+export class SignerMachineImpl extends ActorMachine implements SignerMachine {
+  private _state: SignerState;
+  private _version: number;
+  public readonly type = 'SIGNER' as const;
+  public readonly parentId: string;
+
+  constructor(
+    id: string,
+    eventBus: EventBus,
+    parentId: string,
+    initialState?: SignerState
+  ) {
+    super(id, eventBus);
+    
+    // Get public key from key storage
+    const publicKeyResult = getKeyStorage().getPublicKey(id);
+    if (isLeft(publicKeyResult)) {
+      throw new Error(`Failed to initialize signer: ${(publicKeyResult.left as MachineError).message}`);
+    }
+    
+    this._state = initialState || createSignerState(publicKeyResult.right);
+    this._version = 1;
+    this.parentId = parentId;
+  }
+
+  get state(): SignerState {
+    return this._state;
+  }
+
+  get version(): number {
+    return this._version;
+  }
+
+  // Handle incoming events
+  async handleEvent(event: MachineEvent): Promise<Either<MachineError, void>> {
+    try {
+      const message = event as Message<SignerCommand>;
+      const data = this._state.get('data') as SignerStateData;
+      
+      if (!data) {
+        return left(createMachineError('INVALID_STATE', 'No signer data'));
+      }
+
+      const result = await processCommand(this, message);
+      return pipe(
+        result,
+        map(machine => {
+          this._state = machine.state;
+          this._version = machine.version;
+          return undefined;
+        })
+      );
+    } catch (error) {
+      return left(createMachineError(
+        'INTERNAL_ERROR',
+        'Failed to handle event',
+        error
+      ));
+    }
+  }
+}
 
 // State validation
 const validateSignerState = (state: SignerState): Either<MachineError, void> => {
@@ -86,219 +126,20 @@ const validateSignerState = (state: SignerState): Either<MachineError, void> => 
 };
 
 // Command processing
-export const processCommand = (
+const processCommand = async (
   machine: SignerMachine,
   message: Message<SignerCommand>
-): Either<MachineError, SignerMachine> =>
-  pipe(
-    validateCommand(machine, message),
-    chain(() => executeCommand(machine, message))
-  );
-
-// Command validation
-const validateCommand = (
-  machine: SignerMachine,
-  message: Message<SignerCommand>
-): Either<MachineError, void> => {
+): Promise<Either<MachineError, SignerMachine>> => {
   try {
-    const data = machine.state.get('data') as SignerStateData;
-    
-    switch (message.payload.type) {
-      case 'CREATE_ENTITY':
-        return validateEntityCreation(data.publicKey, message.payload.config);
-        
-      case 'SIGN_TRANSACTION':
-        return validateTransaction(data, message.payload.txHash);
-        
-      default:
-        return right(undefined);
-    }
-  } catch (error) {
-    return left(createMachineError(
-      'VALIDATION_ERROR',
-      'Failed to validate command',
-      error
-    ));
-  }
-};
-
-// Entity validation
-const validateEntityCreation = (
-  signerPublicKey: PublicKey,
-  config: { threshold: number; signers: Array<[PublicKey, number]> }
-): Either<MachineError, void> => {
-  // Check if signer is included
-  if (!config.signers.some(([key]) => key === signerPublicKey)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Signer must be included in entity signers'
-    ));
-  }
-
-  // Validate threshold
-  if (config.threshold <= 0) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Threshold must be positive'
-    ));
-  }
-
-  // Validate signers array
-  if (config.signers.length === 0) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Entity must have at least one signer'
-    ));
-  }
-
-  // Check for duplicate signers
-  const uniqueSigners = new Set(config.signers.map(([key]) => key));
-  if (uniqueSigners.size !== config.signers.length) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Duplicate signers are not allowed'
-    ));
-  }
-
-  // Validate weights
-  const hasInvalidWeight = config.signers.some(([_, weight]) => weight <= 0);
-  if (hasInvalidWeight) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'All signer weights must be positive'
-    ));
-  }
-
-  // Calculate total weight
-  const totalWeight = config.signers.reduce((sum, [_, weight]) => sum + weight, 0);
-
-  // Validate threshold against total weight
-  if (config.threshold > totalWeight) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Threshold cannot be greater than total weight'
-    ));
-  }
-
-  // Validate minimum achievable threshold
-  const sortedWeights = config.signers
-    .map(([_, weight]) => weight)
-    .sort((a, b) => b - a); // Sort descending
-
-    let maxAchievableWeight = 0;
-    for (const weight of sortedWeights) {
-      if (maxAchievableWeight >= config.threshold) break;
-      maxAchievableWeight += weight;
-    }
-
-    if (maxAchievableWeight < config.threshold) {
-      return left(createMachineError(
-        'INVALID_OPERATION',
-        'Threshold cannot be achieved with given signer weights'
-      ));
-    }
-
-  return right(undefined);
-};
-
-// Transaction validation
-const validateTransaction = (
-  data: SignerStateData,
-  txHash: string
-): Either<MachineError, void> => {
-  // Check if transaction exists
-  const transaction = data.pendingTransactions.get(txHash);
-  if (!transaction) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction not found'
-    ));
-  }
-
-  // Check if already signed by this signer
-  if (transaction.signatures.has(data.publicKey)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction already signed by this signer'
-    ));
-  }
-
-  // Check transaction nonce
-  if (transaction.nonce <= data.nonce) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction nonce must be greater than current nonce'
-    ));
-  }
-
-  // Validate transaction metadata
-  return validateTransactionMetadata(transaction);
-};
-
-// Transaction metadata validation
-const validateTransactionMetadata = (
-  transaction: Transaction
-): Either<MachineError, void> => {
-  const now = Date.now();
-
-  // Check basic timestamp validity
-  if (transaction.timestamp > now + 300000) { // 5 minutes in the future
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction timestamp too far in the future'
-    ));
-  }
-
-  // Check validity window
-  if (transaction.metadata.validFrom > now) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction not yet valid'
-    ));
-  }
-
-  if (transaction.metadata.validUntil < now) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Transaction has expired'
-    ));
-  }
-
-  // Check gas parameters
-  if (transaction.metadata.gasLimit <= BigInt(0)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Gas limit must be positive'
-    ));
-  }
-
-  if (transaction.metadata.maxFeePerGas <= BigInt(0)) {
-    return left(createMachineError(
-      'INVALID_OPERATION',
-      'Max fee per gas must be positive'
-    ));
-  }
-
-  // In practice, would also validate:
-  // - Chain ID against current network
-  // - Gas limit against block gas limit
-  // - Max fee against current network conditions
-  
-  return right(undefined);
-};
-
-// Command execution
-const executeCommand = (
-  machine: SignerMachine,
-  message: Message<SignerCommand>
-): Either<MachineError, SignerMachine> => {
-  try {
-    const newState = processSignerCommand(machine.state, message);
-    return right({
-      ...machine,
-      state: newState,
-      version: machine.version + 1
-    });
+    const stateResult = await processSignerCommand(machine.state, message);
+    return pipe(
+      stateResult,
+      map(newState => ({
+        ...machine,
+        state: newState,
+        version: machine.version + 1
+      }))
+    );
   } catch (error) {
     return left(createMachineError(
       'INTERNAL_ERROR',
@@ -309,21 +150,21 @@ const executeCommand = (
 };
 
 // Command processing
-const processSignerCommand = (
+const processSignerCommand = async (
   state: SignerState,
   message: Message<SignerCommand>
-): SignerState => {
+): Promise<Either<MachineError, SignerState>> => {
   const data = state.get('data') as SignerStateData;
   
   switch (message.payload.type) {
     case 'CREATE_ENTITY':
-      return createEntity(state, data, message.payload.config);
+      return Promise.resolve(right(createEntity(state, data, message.payload.config)));
       
     case 'SIGN_TRANSACTION':
-      return signTransaction(state, data, message.payload.txHash);
+      return signTransaction(state, message.payload.txHash);
       
     default:
-      return state;
+      return Promise.resolve(right(state));
   }
 };
 
@@ -333,131 +174,71 @@ const createEntity = (
   data: SignerStateData,
   config: { threshold: number; signers: Array<[PublicKey, number]> }
 ): SignerState => {
-  const entityId = generateEntityId(config);
-  const blockHash = computeEntityHash(config);
-  
   return state.set('data', {
     ...data,
-    entities: data.entities.set(entityId, blockHash),
     nonce: data.nonce + 1
   });
 };
 
 // Transaction signing
-const signTransaction = (
+const signTransaction = async (
   state: SignerState,
-  data: SignerStateData,
   txHash: string
-): SignerState => {
+): Promise<Either<MachineError, SignerState>> => {
+  const data = state.get('data') as SignerStateData;
+  if (!data) {
+    return left(createMachineError('INVALID_STATE', 'No signer data'));
+  }
+
   const transaction = data.pendingTransactions.get(txHash);
-  if (!transaction) return state;
+  if (!transaction) {
+    return left(createMachineError('INVALID_STATE', 'No such transaction'));
+  }
 
-  // Compute signature using secp256k1
-  const { signature, recoveryParam } = computeSignature(transaction, data.publicKey);
-  
+  // Compute message hash
+  const messageHash = computeTransactionHash(transaction);
+
+  // Get private key from secure storage
+  const privateKeyResult = getKeyStorage().getPrivateKey(data.publicKey);
+  if (isLeft(privateKeyResult)) {
+    return left(privateKeyResult.left);
+  }
+
+  // Create signature
+  const signatureResult = createEcdsaSignature(messageHash, privateKeyResult.right);
+  if (isLeft(signatureResult)) {
+    return left(signatureResult.left);
+  }
+
   // Update transaction with new signature
-  const updatedTransaction: SignedTransaction = {
+  const updatedTransaction = {
     ...transaction,
-    signatures: transaction.signatures.set(data.publicKey, signature),
-    recoveryParams: transaction.recoveryParams.set(data.publicKey, recoveryParam)
+    partialSignatures: transaction.partialSignatures.set(data.publicKey, signatureResult.right)
   };
 
-  return state.set('data', {
+  // Update state
+  return right(state.set('data', {
     ...data,
-    pendingTransactions: data.pendingTransactions.set(txHash, updatedTransaction),
-    nonce: data.nonce + 1
-  });
+    pendingTransactions: data.pendingTransactions.set(txHash, updatedTransaction)
+  }));
 };
 
-// Signature computation using secp256k1
-const computeSignature = (
-  transaction: Transaction,
-  publicKey: PublicKey
-): { signature: string; recoveryParam: number } => {
-  // Create deterministic transaction representation
-  const txData = {
-    type: transaction.type,
-    nonce: transaction.nonce,
-    timestamp: transaction.timestamp,
-    sender: transaction.sender,
-    payload: transaction.payload,
-    metadata: {
-      chainId: transaction.metadata.chainId,
-      validFrom: transaction.metadata.validFrom,
-      validUntil: transaction.metadata.validUntil,
-      gasLimit: transaction.metadata.gasLimit.toString(),
-      maxFeePerGas: transaction.metadata.maxFeePerGas.toString()
-    }
-  };
-
-  // Compute transaction hash (RFC 8785 for stable JSON stringification)
-  const txString = JSON.stringify(txData, Object.keys(txData).sort());
-  const messageHash = createHash('sha256').update(txString).digest();
-
-  // In practice, would get the private key from secure storage
-  // Here we derive it deterministically from the public key for demo
-  const privateKey = secp256k1.keyFromPrivate(
-    createHash('sha256').update(publicKey).digest()
-  );
-
-  // Sign the message hash
-  const signature = privateKey.sign(messageHash, { canonical: true });
-
-  // Convert signature to hex string
-  const r = signature.r.toString('hex').padStart(64, '0');
-  const s = signature.s.toString('hex').padStart(64, '0');
-  const signatureHex = r + s;
-
-  return {
-    signature: signatureHex,
-    recoveryParam: signature.recoveryParam || 0
-  };
-};
-
-// Signature verification
-export const verifySignature = (
+// Verify signature
+export const verifySignature = async (
   transaction: SignedTransaction,
   publicKey: PublicKey
-): Either<MachineError, boolean> => {
+): Promise<Either<MachineError, boolean>> => {
   try {
-    const signature = transaction.signatures.get(publicKey);
-    const recoveryParam = transaction.recoveryParams.get(publicKey);
-    
-    if (!signature || recoveryParam === undefined) {
+    const partialSig = transaction.partialSignatures.get(publicKey);
+    if (!partialSig) {
       return left(createMachineError(
         'INVALID_OPERATION',
         'Signature not found'
       ));
     }
 
-    // Reconstruct message hash
-    const txData = {
-      type: transaction.type,
-      nonce: transaction.nonce,
-      timestamp: transaction.timestamp,
-      sender: transaction.sender,
-      payload: transaction.payload,
-      metadata: {
-        chainId: transaction.metadata.chainId,
-        validFrom: transaction.metadata.validFrom,
-        validUntil: transaction.metadata.validUntil,
-        gasLimit: transaction.metadata.gasLimit.toString(),
-        maxFeePerGas: transaction.metadata.maxFeePerGas.toString()
-      }
-    };
-
-    const txString = JSON.stringify(txData, Object.keys(txData).sort());
-    const messageHash = createHash('sha256').update(txString).digest();
-
-    // Parse signature
-    const r = Buffer.from(signature.slice(0, 64), 'hex');
-    const s = Buffer.from(signature.slice(64, 128), 'hex');
-
-    // Verify signature
-    const key = secp256k1.keyFromPublic(publicKey, 'hex');
-    const isValid = key.verify(messageHash, { r, s });
-
-    return right(isValid);
+    const messageHash = computeTransactionHash(transaction);
+    return verifyEcdsaSignature(messageHash, partialSig, publicKey);
   } catch (error) {
     return left(createMachineError(
       'INTERNAL_ERROR',
@@ -468,18 +249,17 @@ export const verifySignature = (
 };
 
 // Transaction hash computation
-export const computeTransactionHash = (transaction: Transaction): string => {
-  const txString = JSON.stringify({
-    type: transaction.type,
-    nonce: transaction.nonce,
-    timestamp: transaction.timestamp,
-    sender: transaction.sender,
-    payload: transaction.payload
-  }, Object.keys(transaction).sort());
-
-  return createHash('sha256')
-    .update(txString)
-    .digest('hex');
+const computeTransactionHash = (transaction: Transaction): Uint8Array => {
+  const hash = createHash('sha256')
+    .update(JSON.stringify({
+      nonce: transaction.nonce,
+      sender: transaction.sender,
+      type: transaction.type,
+      payload: transaction.payload
+    }))
+    .digest();
+    
+  return new Uint8Array(hash);
 };
 
 // Event generation for signed transactions
@@ -489,7 +269,8 @@ export const generateTransactionSignedEvent = (
 ): Event => ({
   type: 'STATE_UPDATED',
   machineId: txHash,
-  version: 1
+  version: 1,
+  stateRoot: createHash('sha256').update(`${txHash}_${signer}_${Date.now()}`).digest('hex')
 });
 
 // Helper functions
@@ -508,7 +289,8 @@ const computeEntityHash = (config: { threshold: number; signers: Array<[PublicKe
 export const generateEntityCreatedEvent = (entityId: string): Event => ({
   type: 'STATE_UPDATED',
   machineId: entityId,
-  version: 1
+  version: 1,
+  stateRoot: createHash('sha256').update(`entity_${entityId}_${Date.now()}`).digest('hex')
 });
 
 // Batch signature verification
@@ -517,40 +299,19 @@ export type BatchVerificationResult = {
   readonly errors: Map<PublicKey, MachineError>;
 };
 
-export const verifySignaturesBatch = (
+export const verifySignaturesBatch = async (
   transaction: SignedTransaction,
   publicKeys: ReadonlyArray<PublicKey>
-): Either<MachineError, BatchVerificationResult> => {
+): Promise<Either<MachineError, BatchVerificationResult>> => {
   try {
-    // Reconstruct message hash (only once for all verifications)
-    const txData = {
-      type: transaction.type,
-      nonce: transaction.nonce,
-      timestamp: transaction.timestamp,
-      sender: transaction.sender,
-      payload: transaction.payload,
-      metadata: {
-        chainId: transaction.metadata.chainId,
-        validFrom: transaction.metadata.validFrom,
-        validUntil: transaction.metadata.validUntil,
-        gasLimit: transaction.metadata.gasLimit.toString(),
-        maxFeePerGas: transaction.metadata.maxFeePerGas.toString()
-      }
-    };
-
-    const txString = JSON.stringify(txData, Object.keys(txData).sort());
-    const messageHash = createHash('sha256').update(txString).digest();
-
-    // Initialize result maps
+    const messageHash = computeTransactionHash(transaction);
     let allValid = true;
     const errors = Map<PublicKey, MachineError>().asMutable();
 
     // Verify each signature
     for (const publicKey of publicKeys) {
-      const signature = transaction.signatures.get(publicKey);
-      const recoveryParam = transaction.recoveryParams.get(publicKey);
-
-      if (!signature || recoveryParam === undefined) {
+      const partialSig = transaction.partialSignatures.get(publicKey);
+      if (!partialSig) {
         allValid = false;
         errors.set(publicKey, createMachineError(
           'INVALID_OPERATION',
@@ -559,28 +320,15 @@ export const verifySignaturesBatch = (
         continue;
       }
 
-      try {
-        // Parse signature
-        const r = Buffer.from(signature.slice(0, 64), 'hex');
-        const s = Buffer.from(signature.slice(64, 128), 'hex');
-
-        // Verify signature
-        const key = secp256k1.keyFromPublic(publicKey, 'hex');
-        const isValid = key.verify(messageHash, { r, s });
-
-        if (!isValid) {
-          allValid = false;
-          errors.set(publicKey, createMachineError(
-            'INVALID_OPERATION',
-            'Invalid signature'
-          ));
-        }
-      } catch (error) {
+      const result = await verifyEcdsaSignature(messageHash, partialSig, publicKey);
+      if (isLeft(result)) {
+        allValid = false;
+        errors.set(publicKey, result.left);
+      } else if (!result.right) {
         allValid = false;
         errors.set(publicKey, createMachineError(
-          'INTERNAL_ERROR',
-          'Failed to verify signature',
-          error
+          'INVALID_OPERATION',
+          'Invalid signature'
         ));
       }
     }
@@ -596,34 +344,4 @@ export const verifySignaturesBatch = (
       error
     ));
   }
-};
-
-// Helper function to verify entity signatures
-export const verifyEntitySignatures = (
-  transaction: SignedTransaction,
-  config: EntityConfig
-): Either<MachineError, { 
-  readonly isValid: boolean;
-  readonly totalWeight: number;
-  readonly errors: Map<PublicKey, MachineError>;
-}> => {
-  return pipe(
-    verifySignaturesBatch(transaction, Array.from(config.signers.keys())),
-    map(result => {
-      let totalWeight = 0;
-
-      // Calculate total weight of valid signatures
-      for (const [publicKey, weight] of config.signers) {
-        if (!result.errors.has(publicKey)) {
-          totalWeight += weight;
-        }
-      }
-
-      return {
-        isValid: totalWeight >= config.threshold,
-        totalWeight,
-        errors: result.errors
-      };
-    })
-  );
 }; 

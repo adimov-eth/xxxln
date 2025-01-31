@@ -2,28 +2,29 @@
   "name": "xxxln",
   "version": "1.0.0",
   "description": "Decentralized payment network",
-  "main": "index.js",
+  "private": true,
   "scripts": {
     "start": "bun ./packages/core/src/scripts/runNodes.ts",
-    "test": "jest",
-    "build": "tsc"
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "simulator": "cd packages/simulator && bun run src/runNodes.ts",
+    "dashboard": "cd packages/dashboard && pnpm dev",
+    "dev": "concurrently \"pnpm simulator\" \"pnpm dashboard\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@9.15.1+sha512.1acb565e6193efbebda772702950469150cf12bcc764262e7587e71d19dc98a423dff9536e57ea44c49bdf790ff694e83c27be5faa23d67e0c033b583be4bfcf",
-  "dependencies": {
-    "fp-ts": "^2.16.1",
-    "immutable": "^4.3.4",
-    "ws": "^8.16.0",
-    "elliptic": "^6.5.4"
-  },
+  "workspaces": [
+    "packages/*"
+  ],
   "devDependencies": {
-    "@types/node": "^20.11.16",
-    "@types/ws": "^8.5.10",
+    "@types/node": "^20.17.16",
     "typescript": "^5.3.3",
-    "ts-node": "^10.9.2",
     "jest": "^29.7.0",
-    "@types/jest": "^29.5.11"
+    "ts-node": "^10.9.2",
+    "concurrently": "^8.2.2"
   }
 }
