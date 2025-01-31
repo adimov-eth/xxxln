@@ -157,8 +157,8 @@ export async function runBlockProductionLoop(
     const newHeight = chainState.height + 1;
     
     const header: BlockHeader = {
-      blockNumber: newHeight,
-      parentHash: chainState.tipHash,
+      height: newHeight,
+      prevHash: chainState.tipHash,
       proposer: proposerId,
       timestamp: Date.now(),
       transactionsRoot: createHash('sha256').update(safeStringify(transaction)).digest('hex'),

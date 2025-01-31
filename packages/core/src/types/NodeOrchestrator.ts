@@ -13,6 +13,12 @@ export interface NodeOrchestratorConfig {
   readonly networkTimeout: number;
   readonly retryAttempts: number;
   readonly topology: NetworkTopology;
+  readonly consensusConfig?: {
+    readonly minValidators: number;
+    readonly blockTime: number;
+    readonly maxBlockSize: number;
+    readonly minGasPrice: bigint;
+  };
 }
 
 export interface NodeConfig {
@@ -23,6 +29,8 @@ export interface NodeConfig {
   readonly port: number;
   readonly host: string;
   readonly isBootstrap?: boolean;
+  readonly isValidator?: boolean;
+  readonly validatorWeight?: number;
 }
 
 export interface NodeMetrics {
@@ -32,6 +40,11 @@ export interface NodeMetrics {
   readonly pendingTransactions: number;
   readonly networkLatency: number;
   readonly syncStatus: NetworkState;
+  readonly consensusParticipation?: {
+    readonly proposedBlocks: number;
+    readonly validatedBlocks: number;
+    readonly missedBlocks: number;
+  };
 }
 
 export interface NodeHealth {
@@ -80,4 +93,30 @@ export enum LogLevel {
   WARN = 'WARN',
   INFO = 'INFO',
   DEBUG = 'DEBUG'
+}
+
+// Consensus types
+export interface ConsensusRound {
+  readonly height: number;
+  readonly round: number;
+  readonly proposer: string;
+  readonly votes: Map<string, boolean>;
+  readonly startTime: number;
+  readonly timeout: number;
+}
+
+export interface ConsensusState {
+  readonly currentRound: ConsensusRound;
+  readonly lastFinalizedHeight: number;
+  readonly validators: Map<string, number>; // validator -> weight
+  readonly proposerSequence: ReadonlyArray<string>;
+}
+
+export interface ConsensusConfig {
+  readonly minValidators: number;
+  readonly blockTime: number;
+  readonly maxBlockSize: number;
+  readonly minGasPrice: bigint;
+  readonly roundTimeout: number;
+  readonly maxRounds: number;
 } 

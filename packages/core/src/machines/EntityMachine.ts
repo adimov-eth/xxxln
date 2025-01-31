@@ -4,280 +4,306 @@ import { pipe, flow } from 'fp-ts/function';
 import { createHash } from 'crypto';
 import { TaskEither, tryCatch } from 'fp-ts/TaskEither';
 
-import { MachineError, Message, createMachineError, MachineEvent, MachineId } from '../types/Core';
-import { 
-  EntityMachine, 
-  EntityState, 
-  EntityConfig,
-  BlockHash,
-  PublicKey,
-  SignedTransaction,
-  Transaction
-} from '../types/MachineTypes';
+import { MachineError, Message, createMachineError, MachineId, Hash } from '../types/Core';
 import { EntityCommand, Event } from '../types/Messages';
 import { Proposal, ProposalId, ProposalStatus } from '../types/ProposalTypes';
-import { ActorMachine } from '../eventbus/BaseMachine';
+import { AbstractBaseMachine, BaseMachineState } from './BaseMachine';
 import { EventBus } from '../eventbus/EventBus';
 import { verifyEcdsaSignature } from '../crypto/EcdsaSignatures';
+import { Block, BlockHeader, MempoolEntry } from '../types/BlockTypes';
+import { EntityConfig, EntityMachine, EntityState, SignedTransaction } from '../types/MachineTypes';
 
-interface EntityStateData {
-  config: EntityConfig;
-  channels: Map<string, BlockHash>;
-  balance: bigint;
-  nonce: number;
-  proposals: Map<ProposalId, Proposal>;
+// -------------------------------------------------
+// NEW TYPES TO FIX UNDEFINED REFERENCE ERRORS
+// -------------------------------------------------
+type BlockHash = Hash;  // alias for clarity
+export type Transaction = {
+  readonly nonce: number;
+  readonly sender: string;
+  readonly type: string;
+  readonly payload: unknown;
+};
+
+// Extended base state for entity
+export interface EntityStateData extends BaseMachineState {
+    readonly config: EntityConfig;
+    readonly channels: Map<string, Hash>;
+    readonly balance: bigint;
+    readonly nonce: number;
+    readonly proposals: Map<ProposalId, Proposal>;
+    readonly pendingTransactions: Map<string, SignedTransaction>;
 }
 
-// State management with proposals
+// Create initial entity state -- ADDED proposals and pendingTransactions, and childIds is mutable
 export const createEntityState = (
-  config: EntityConfig,
-  channels: Map<string, BlockHash> = Map(),
-  balance: bigint = BigInt(0),
-  nonce: number = 0
-): EntityState => Map<string, EntityStateData>().set('data', {
-  config,
-  channels,
-  balance,
-  nonce,
-  proposals: Map()
-});
-
-// Helper functions for proposal management
-const createProposal = (
-  proposer: MachineId,
-  type: 'TRANSACTION' | 'CONFIG_UPDATE',
-  transaction?: SignedTransaction,
-  newConfig?: EntityConfig
-): Proposal => ({
-  id: `proposal_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-  proposer,
-  type,
-  transaction,
-  newConfig,
-  approvals: Map<MachineId, boolean>().set(proposer, true),
-  status: 'ACTIVE',
-  timestamp: Date.now(),
-  expiresAt: Date.now() + 24 * 60 * 60 * 1000 // 24 hours expiry
-});
-
-const checkProposalThreshold = (
-  proposal: Proposal,
-  config: EntityConfig
-): { isThresholdMet: boolean; totalWeight: number } => {
-  let totalWeight = 0;
-  
-  // Sum weights of signers who approved
-  for (const [signer, weight] of config.signers) {
-    if (proposal.approvals.get(signer)) {
-      totalWeight += weight;
-    }
-  }
-  
-  return {
-    isThresholdMet: totalWeight >= config.threshold,
-    totalWeight
-  };
-};
-
-const executeProposal = (
-  state: EntityState,
-  proposalId: ProposalId
-): Either<MachineError, EntityState> => {
-  const data = state.get('data') as EntityStateData;
-  if (!data) {
-    return left(createMachineError('INVALID_STATE', 'No entity data'));
-  }
-
-  const proposal = data.proposals.get(proposalId);
-  if (!proposal || proposal.status !== 'ACTIVE') {
-    return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found or not active'));
-  }
-
-  // Mark as executed
-  const updatedProposal = {
-    ...proposal,
-    status: 'EXECUTED' as ProposalStatus
-  };
-
-  let newState = state.set('data', {
-    ...data,
-    proposals: data.proposals.set(proposalId, updatedProposal)
-  });
-
-  // Apply the actual changes
-  switch (proposal.type) {
-    case 'TRANSACTION':
-      if (proposal.transaction) {
-        return processTransaction(newState, proposal.transaction);
-      }
-      break;
-
-    case 'CONFIG_UPDATE':
-      if (proposal.newConfig) {
-        return right(newState.set('data', {
-          ...data,
-          config: proposal.newConfig,
-          nonce: data.nonce + 1
-        }));
-      }
-      break;
-  }
-
-  return right(newState);
-};
-
-// Event-driven entity machine
-export class EntityMachineImpl extends ActorMachine implements EntityMachine {
-  public readonly type = 'ENTITY' as const;
-  public readonly inbox: MachineEvent[] = [];
-  private _state: EntityState;
-  private _version: number;
-  public readonly parentId: string;
-
-  constructor(
-    id: string,
-    parentId: string,
     config: EntityConfig,
-    eventBus: EventBus,
-    initialState: EntityState = createEntityState(config)
-  ) {
-    super(id, eventBus);
-    this.parentId = parentId;
-    this._state = initialState;
-    this._version = 1;
-  }
+    parentId: string
+): EntityStateData => ({
+    blockHeight: 0,
+    latestHash: '',
+    stateRoot: '',
+    data: Map(),
+    nonces: Map(),
+    parentId,
+    childIds: [],
+    config,
+    channels: Map(),
+    balance: BigInt(0),
+    nonce: 0,
+    proposals: Map(),
+    pendingTransactions: Map()
+});
 
-  // Implement readonly properties
-  get state(): EntityState {
-    return this._state;
-  }
+// Helper function to compute transaction hash
+const computeTransactionHash = (transaction: SignedTransaction): Buffer => 
+    createHash('sha256')
+        .update(JSON.stringify({
+            nonce: transaction.nonce,
+            sender: transaction.sender,
+            type: transaction.type,
+            payload: transaction.payload
+        }))
+        .digest();
 
-  get version(): number {
-    return this._version;
-  }
 
-  // Handle incoming events
-  async handleEvent(event: MachineEvent): Promise<Either<MachineError, void>> {
-    try {
-      const message = event as Message<EntityCommand>;
-      
-      const commandResult = await processCommand(this, message);
-      if (isLeft(commandResult)) {
-        return commandResult as Either<MachineError, void>;
-      }
-
-      const machine = commandResult.right;
-      this._state = machine.state;
-      this._version = machine.version;
-
-      // Dispatch appropriate events based on command type
-      switch (message.payload.type) {
-        case 'PROPOSE_TRANSACTION': {
-          const proposal = createProposal(
-            message.sender,
-            'TRANSACTION',
-            message.payload.transaction
-          );
-
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'PROPOSAL_CREATED',
-            payload: { 
-              proposalId: proposal.id,
-              proposer: message.sender
-            },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-
-        case 'APPROVE_PROPOSAL': {
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'PROPOSAL_APPROVED',
-            payload: { 
-              proposalId: message.payload.proposalId,
-              approver: message.sender
-            },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-
-        case 'CANCEL_PROPOSAL': {
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'PROPOSAL_CANCELLED',
-            payload: { 
-              proposalId: message.payload.proposalId
-            },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-
-        case 'UPDATE_CONFIG': {
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'CONFIG_UPDATED',
-            payload: { newConfig: message.payload.newConfig },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-
-        case 'OPEN_CHANNEL': {
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'CHANNEL_OPENED',
-            payload: { 
-              channelId: generateChannelId(this.id, message.payload.partnerId),
-              partnerId: message.payload.partnerId
-            },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-
-        case 'CLOSE_CHANNEL': {
-          const outEvent: MachineEvent = {
-            id: `evt_${Date.now()}`,
-            type: 'CHANNEL_CLOSED',
-            payload: { channelId: message.payload.channelId },
-            sender: this.id,
-            target: this.parentId,
-            timestamp: Date.now()
-          };
-          this.eventBus.dispatch(outEvent);
-          break;
-        }
-      }
-
-      return right(undefined);
-    } catch (error) {
-      return left(createMachineError(
-        'INTERNAL_ERROR',
-        'Failed to handle event',
-        error
-      ));
+function localExecuteProposal(state: EntityState, proposalId: ProposalId): Either<MachineError, EntityState> {
+    const data = state.get('data') as EntityStateData;
+    const proposal = data.proposals.get(proposalId);
+    if (!proposal) {
+        return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found'));
     }
-  }
+    const updatedProposal = {
+        ...proposal,
+        status: 'EXECUTED' as ProposalStatus,
+        finalizedAt: Date.now()
+    };
+    const newState = state.set('data', {
+        ...data,
+        proposals: data.proposals.set(proposalId, updatedProposal)
+    });
+    return right(newState);
 }
+
+// Entity machine implementation
+export class EntityMachineImpl extends AbstractBaseMachine {
+    protected _entityState: EntityStateData;
+
+    constructor(
+        id: string,
+        eventBus: EventBus,
+        parentId: string,
+        config: EntityConfig
+    ) {
+        const initialState = createEntityState(config, parentId);
+        super(id, 'ENTITY', eventBus, initialState);
+        this._entityState = initialState;
+    }
+
+    protected async processEntityCommand(message: Message<EntityCommand>): Promise<Either<MachineError, void>> {
+        try {
+            switch (message.payload.type) {
+                case 'PROPOSE_TRANSACTION': {
+                    const proposal = createProposal(
+                        message.sender,
+                        'TRANSACTION',
+                        message.payload.transaction
+                    );
+
+                    this._entityState = {
+                        ...this._entityState,
+                        proposals: this._entityState.proposals.set(proposal.id, proposal)
+                    };
+                    this._state = this._entityState;
+                    this._version += 1;
+
+                    const outEvent: Event = {
+                        type: 'PROPOSAL_CREATED',
+                        proposalId: proposal.id,
+                        proposer: message.sender
+                    };
+                    this.eventBus.dispatch(outEvent);
+                    return right(undefined);
+                }
+
+                case 'APPROVE_PROPOSAL': {
+                    const proposal = this._entityState.proposals.get(message.payload.proposalId);
+                    if (!proposal) {
+                        return left(createMachineError('INVALID_PROPOSAL', 'Proposal not found'));
+                    }
+
+                    const updatedProposal = {
+                        ...proposal,
+                        approvals: proposal.approvals.set(message.sender, true)
+                    };
+
+                    const { isThresholdMet } = checkProposalThreshold(
+                        updatedProposal,
+                        this._entityState.config
+                    );
+
+                    if (isThresholdMet) {
+                        const executeResult = await this.executeProposal(updatedProposal);
+                        if (isLeft(executeResult)) {
+                            return executeResult;
+                        }
+                    }
+
+                    this._entityState = {
+                        ...this._entityState,
+                        proposals: this._entityState.proposals.set(proposal.id, updatedProposal)
+                    };
+                    this._state = this._entityState;
+                    this._version += 1;
+
+                    const outEvent: Event = {
+                        type: 'PROPOSAL_APPROVED',
+                        proposalId: message.payload.proposalId,
+                        approver: message.sender
+                    };
+                    this.eventBus.dispatch(outEvent);
+                    return right(undefined);
+                }
+
+                default:
+                    return right(undefined);
+            }
+        } catch (error) {
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to process command', error));
+        }
+    }
+
+    async handleEvent(event: Message<unknown>): Promise<Either<MachineError, void>> {
+        if (event.type === 'COMMAND') {
+            return this.processEntityCommand(event as Message<EntityCommand>);
+        }
+        return right(undefined);
+    }
+
+    verifyStateTransition(from: BaseMachineState, to: BaseMachineState): Either<MachineError, boolean> {
+        try {
+            const fromEntity = from as EntityStateData;
+            const toEntity = to as EntityStateData;
+
+            if (to.blockHeight < from.blockHeight) {
+                return right(false);
+            }
+
+            // Verify config hasn't changed without proper proposal
+            if (toEntity.config !== fromEntity.config) {
+                const configProposal = Array.from(toEntity.proposals.values())
+                    .find(p => p.type === 'CONFIG_UPDATE' && p.status === 'EXECUTED');
+                if (!configProposal) {
+                    return right(false);
+                }
+            }
+
+            // Verify all executed proposals meet threshold
+            for (const proposal of toEntity.proposals.values()) {
+                if (proposal.status === 'EXECUTED') {
+                    const { isThresholdMet } = checkProposalThreshold(proposal, toEntity.config);
+                    if (!isThresholdMet) {
+                        return right(false);
+                    }
+                }
+            }
+
+            return right(true);
+        } catch (error) {
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to verify state transition', error));
+        }
+    }
+
+    private async executeProposal(proposal: Proposal): Promise<Either<MachineError, void>> {
+        try {
+            switch (proposal.type) {
+                case 'TRANSACTION': {
+                    if (!proposal.transaction) {
+                        return left(createMachineError('INVALID_PROPOSAL', 'No transaction in proposal'));
+                    }
+
+                    const txHash = computeTransactionHash(proposal.transaction);
+                    this._entityState = {
+                        ...this._entityState,
+                        pendingTransactions: this._entityState.pendingTransactions.set(
+                            txHash.toString('hex'),
+                            proposal.transaction
+                        )
+                    };
+                    break;
+                }
+
+                case 'CONFIG_UPDATE': {
+                    if (!proposal.newConfig) {
+                        return left(createMachineError('INVALID_PROPOSAL', 'No config in proposal'));
+                    }
+
+                    this._entityState = {
+                        ...this._entityState,
+                        config: proposal.newConfig
+                    };
+                    break;
+                }
+            }
+
+            // Update proposal status
+            this._entityState = {
+                ...this._entityState,
+                proposals: this._entityState.proposals.set(proposal.id, {
+                    ...proposal,
+                    status: 'EXECUTED' as ProposalStatus,
+                    finalizedAt: Date.now()
+                })
+            };
+
+            this._state = this._entityState;
+            this._version += 1;
+
+            const outEvent: Event = {
+                type: 'PROPOSAL_EXECUTED',
+                proposalId: proposal.id
+            };
+            this.eventBus.dispatch(outEvent);
+
+            return right(undefined);
+        } catch (error) {
+            return left(createMachineError('INTERNAL_ERROR', 'Failed to execute proposal', error));
+        }
+    }
+}
+
+// Helper functions
+const checkProposalThreshold = (
+    proposal: Proposal,
+    config: EntityConfig
+): { isThresholdMet: boolean; totalWeight: number } => {
+    let totalWeight = 0;
+    for (const [signer, weight] of config.signers) {
+        if (proposal.approvals.get(signer)) {
+            totalWeight += weight;
+        }
+    }
+    return {
+        isThresholdMet: totalWeight >= config.threshold,
+        totalWeight
+    };
+};
+
+const createProposal = (
+    proposer: MachineId,
+    type: 'TRANSACTION' | 'CONFIG_UPDATE',
+    transaction?: SignedTransaction,
+    newConfig?: EntityConfig
+): Proposal => ({
+    id: `proposal_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    proposer,
+    type,
+    transaction,
+    newConfig,
+    approvals: Map<MachineId, boolean>().set(proposer, true),
+    status: 'ACTIVE',
+    timestamp: Date.now(),
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000 // 24 hours expiry
+});
 
 // Helper function to generate channel ID
 const generateChannelId = (entityId: string, partnerId: string): string => {
@@ -291,40 +317,18 @@ export const createEntityMachine = (
   parentId: string,
   config: EntityConfig,
   eventBus: EventBus,
-  initialState: EntityState = createEntityState(config)
-): Either<MachineError, EntityMachine> => 
+  initialState: EntityStateData = createEntityState(config, parentId)
+): Either<MachineError, EntityMachineImpl> => 
   pipe(
     validateEntityState(initialState),
-    map(() => ({
-      id,
-      type: 'ENTITY' as const,
-      state: initialState,
-      version: 1,
-      parentId,
-      inbox: [],
-      eventBus,
-      handleEvent: async (event: MachineEvent) => right(undefined)
-    }))
+    map(() => new EntityMachineImpl(id, eventBus, parentId, config))
   );
 
 // State validation
-const validateEntityState = (state: EntityState): Either<MachineError, void> => {
+const validateEntityState = (state: EntityStateData): Either<MachineError, void> => {
   try {
-    const data = state.get('data');
-    if (!data || typeof data !== 'object') {
-      return left(createMachineError(
-        'INVALID_STATE',
-        'Entity state must contain data object'
-      ));
-    }
-
-    const { config, balance, nonce } = data as {
-      config: EntityConfig;
-      channels: Map<string, BlockHash>;
-      balance: bigint;
-      nonce: number;
-    };
-
+    const { config, balance, nonces } = state;
+    
     // Validate threshold
     if (config.threshold <= 0) {
       return left(createMachineError(
@@ -358,14 +362,6 @@ const validateEntityState = (state: EntityState): Either<MachineError, void> => 
       return left(createMachineError(
         'INVALID_STATE',
         'Threshold cannot be greater than total weight'
-      ));
-    }
-
-    // Validate nonce
-    if (typeof nonce !== 'number' || nonce < 0) {
-      return left(createMachineError(
-        'INVALID_STATE',
-        'Nonce must be a non-negative number'
       ));
     }
 
@@ -557,7 +553,7 @@ const validateChannelOperation = (
   }
 
   const { channels } = data as {
-    channels: Map<string, BlockHash>;
+    channels: Map<string, Hash>;
   };
 
   // Check if channel already exists
@@ -606,7 +602,7 @@ const validateChannelClosure = (
   }
 
   const { channels, config } = data as {
-    channels: Map<string, BlockHash>;
+    channels: Map<string, Hash>;
     config: EntityConfig;
   };
 
@@ -794,7 +790,7 @@ const verifySignature = (
   publicKey: string
 ): Either<MachineError, boolean> => {
   try {
-    const messageBuffer = Buffer.from(message);
+    const messageBuffer = Buffer.from(message, 'utf8');
     return verifyEcdsaSignature(messageBuffer, signature, publicKey);
   } catch (error) {
     return left(createMachineError(
@@ -874,7 +870,7 @@ const processEntityCommand = (
       // Check if threshold is met
       const { isThresholdMet } = checkProposalThreshold(updatedProposal, data.config);
       if (isThresholdMet) {
-        return executeProposal(newState, proposalId);
+        return localExecuteProposal(newState, proposalId);
       }
 
       return right(newState);
@@ -1082,18 +1078,4 @@ const computeStateHash = (state: EntityState): Either<MachineError, BlockHash> =
       error
     ));
   }
-};
-
-// Transaction hash computation
-const computeTransactionHash = (transaction: Transaction): Uint8Array => {
-  const hash = createHash('sha256')
-    .update(JSON.stringify({
-      nonce: transaction.nonce,
-      sender: transaction.sender,
-      type: transaction.type,
-      payload: transaction.payload
-    }))
-    .digest();
-    
-  return new Uint8Array(hash);
 }; 

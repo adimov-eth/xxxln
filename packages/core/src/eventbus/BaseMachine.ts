@@ -1,5 +1,5 @@
 import { Either } from 'fp-ts/Either';
-import { MachineError, MachineEvent } from '../types/Core';
+import { MachineError, Event as MachineEvent } from '../types/Core';
 import { EventBus } from './EventBus';
 
 /**
@@ -22,7 +22,6 @@ export interface BaseMachine {
 /**
  * Abstract base class that implements common actor machine functionality
  */
-
 export abstract class ActorMachine {
   constructor(
     public readonly id: string,

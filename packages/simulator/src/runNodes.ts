@@ -1,4 +1,4 @@
-import { ServerCommand } from '@xxxln/core/src/types/Messages';
+import { ServerCommand } from '@xxxln/core';
 import { 
   NetworkManager,
   NodeInfo,
@@ -29,7 +29,10 @@ import {
   createMempoolState,
   MempoolEntry
 } from '@xxxln/core';
-import type { Transaction, TransactionType } from '@xxxln/core/src/types/MachineTypes';
+import {
+  Transaction,
+  TransactionType
+} from '@xxxln/core';
 import { Map as ImmutableMap } from 'immutable';
 import { createHash } from 'crypto';
 import { createDashboardServer } from './dashboard.js';

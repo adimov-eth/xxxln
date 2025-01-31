@@ -2,6 +2,7 @@ import { Map } from 'immutable';
 
 // Basic types
 export type MachineId = string;
+export type Hash = string;
 
 // Base Machine interface
 export interface Machine {
@@ -24,7 +25,10 @@ export type ErrorCode =
   | 'INVALID_OPERATION'
   | 'VALIDATION_ERROR'
   | 'INVALID_CONFIG'
-  | 'NETWORK_ERROR';
+  | 'NETWORK_ERROR'
+  | 'INVALID_BLOCK'
+  | 'INVALID_TRANSACTION'
+  | 'INVALID_STATE_TRANSITION';
 
 export type MachineError = {
   readonly code: ErrorCode;
@@ -43,10 +47,18 @@ export const createMachineError = (
 });
 
 // State management
-export type State = Map<string, unknown>;
+export interface State {
+  readonly blockHeight: number;
+  readonly latestHash: Hash;
+  readonly stateRoot: Hash;
+  readonly data: Map<string, unknown>;
+  readonly nonces: Map<MachineId, number>;
+  readonly parentId: MachineId | null;
+  readonly childIds: ReadonlyArray<MachineId>;
+}
 
 // Message types
-export type Message<T = unknown> = {
+export interface Message<T = unknown> {
   readonly id: string;
   readonly type: string;
   readonly payload: T;
@@ -55,10 +67,10 @@ export type Message<T = unknown> = {
   readonly recipient: MachineId;
   readonly correlationId?: string;
   readonly causationId?: string;
-};
+}
 
 // Event types
-export type MachineEvent = {
+export interface Event {
   readonly id: string;
   readonly type: string;
   readonly payload: unknown;
@@ -67,7 +79,24 @@ export type MachineEvent = {
   readonly timestamp: number;
   readonly correlationId?: string;
   readonly causationId?: string;
-};
+  readonly machineId?: MachineId;
+  readonly version?: number;
+  readonly stateRoot?: Hash;
+}
+
+// Block types
+export interface Block {
+  readonly header: {
+    readonly height: number;
+    readonly timestamp: number;
+    readonly prevHash: Hash;
+    readonly stateRoot: Hash;
+    readonly transactionsRoot: Hash;
+    readonly proposer: MachineId;
+  };
+  readonly transactions: ReadonlyArray<Message>;
+  readonly signatures: Map<MachineId, string>;
+}
 
 // Log level enum
 export enum LogLevel {

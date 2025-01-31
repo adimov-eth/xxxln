@@ -1,10 +1,11 @@
 import { Map } from 'immutable';
-import { Machine, MachineId, State } from './Core';
+import { Machine, MachineId, State, Hash, Block } from './Core';
 import { MempoolState, BlockProductionConfig } from './BlockTypes';
 import { BaseMachine } from '../eventbus/BaseMachine';
+import { Proposal } from './ProposalTypes';
 
 // Common types for all machines
-export type BlockHash = string;
+export type BlockHash = Hash;
 export type SignatureData = string;
 export type PublicKey = string;
 export type PrivateKey = string;
@@ -14,7 +15,11 @@ export type TransactionType =
   | 'TRANSFER'
   | 'CHANNEL_UPDATE'
   | 'CONFIG_UPDATE'
-  | 'STATE_UPDATE';
+  | 'STATE_UPDATE'
+  | 'PROPOSAL_CREATE'
+  | 'PROPOSAL_VOTE'
+  | 'BLOCK_PROPOSE'
+  | 'BLOCK_VOTE';
 
 export type TransactionMetadata = {
   readonly chainId: string;
@@ -87,22 +92,26 @@ export type SignerMachine = Machine & {
 
 // Entity Machine Types
 export interface EntityConfig {
-  threshold: number;
-  signers: Map<string, number>; // signer -> weight
-  admins?: string[];
+  readonly threshold: number;
+  readonly signers: Map<string, number>; // signer -> weight
+  readonly admins?: ReadonlyArray<string>;
 }
 
-export type EntityState = State & Map<string, {
+export interface EntityStateData extends State {
   readonly config: EntityConfig;
   readonly channels: Map<MachineId, BlockHash>;
   readonly balance: bigint;
   readonly nonce: number;
-}>;
+  readonly proposals: Map<string, Proposal>;
+  readonly pendingTransactions: Map<string, SignedTransaction>;
+}
+
+export type EntityState = Map<string, EntityStateData>;
 
 export interface EntityMachine extends Machine, BaseMachine {
   readonly type: 'ENTITY';
   readonly state: EntityState;
-  readonly parentId: string;
+  readonly parentId: MachineId;
 }
 
 // Channel Machine Types

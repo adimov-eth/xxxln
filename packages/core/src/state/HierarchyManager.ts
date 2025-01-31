@@ -1,8 +1,8 @@
 import { Either, left, right } from 'fp-ts/Either';
 import { pipe } from 'fp-ts/function';
-import { MachineError, createMachineError, MachineId } from '../types/Core';
-import { EntityMachine, EntityConfig, EntityState } from '../types/MachineTypes';
-import { ServerMachine, ServerState } from '../types/MachineTypes';
+import { MachineError, createMachineError, MachineId, Hash } from '../types/Core';
+import { EntityMachine, EntityConfig, EntityState, EntityStateData } from '../types/MachineTypes';
+import { ServerMachine } from '../types/MachineTypes';
 import { SignerMachine } from '../types/MachineTypes';
 import { Map } from 'immutable';
 import { createHash } from 'crypto';
@@ -20,9 +20,9 @@ export function createEntityForSigner(
   config: EntityConfig,
   entityMachineFactory: (id: MachineId, parentId: MachineId, config: EntityConfig) => Either<MachineError, EntityMachine>
 ): Either<MachineError, EntityMachine> {
-  // Generate a new machine ID (for example, a hash of config + signer key).
+  // Generate a deterministic entity ID based on signer and config
   const entityId = createHash('sha256')
-    .update(`${signer.id}_${Date.now()}`)
+    .update(`${signer.id}_${JSON.stringify(config)}_${Date.now()}`)
     .digest('hex')
     .slice(0, 16);
 
@@ -38,13 +38,18 @@ export function attachEntityToServer(
   entity: EntityMachine
 ): Either<MachineError, ServerMachine> {
   try {
-    const serverData = server.state.get('data') as { submachines: Map<string, string> };
+    const serverData = server.state.get('data') as { submachines: Map<string, Hash> };
     if (!serverData) {
       return left(createMachineError('INVALID_STATE', 'Server state data is missing'));
     }
 
-    // E.g. store the child's state root as empty for now, or the actual computed root:
-    const updatedSubmachines = serverData.submachines.set(entity.id, '');
+    // Compute entity's state root
+    const entityStateRoot = createHash('sha256')
+      .update(JSON.stringify(entity.state))
+      .digest('hex');
+
+    // Update server's submachines map with entity's state root
+    const updatedSubmachines = serverData.submachines.set(entity.id, entityStateRoot);
 
     const updatedData = {
       ...serverData,
@@ -58,8 +63,8 @@ export function attachEntityToServer(
       state: newServerState,
       version: server.version + 1
     };
-    return right(updatedServer);
 
+    return right(updatedServer);
   } catch (error) {
     return left(createMachineError('INTERNAL_ERROR', 'Failed to attach entity to server', error));
   }
@@ -76,37 +81,40 @@ export function connectSignerToEntity(
   weight: number
 ): Either<MachineError, EntityMachine> {
   try {
-    const entityData = entity.state.get(entity.id) as { 
-      config: EntityConfig;
-      channels: Map<string, string>;
-      balance: bigint;
-      nonce: number;
-    };
+    const entityData = entity.state.get(entity.id) as EntityStateData;
     if (!entityData) {
       return left(createMachineError('INVALID_STATE', 'Entity data not found'));
     }
-    if (!entityData.config) {
-      return left(createMachineError('INVALID_STATE', 'Entity config is missing'));
+
+    // Get signer's public key
+    const signerData = newSigner.state.get('data') as { publicKey: string };
+    if (!signerData?.publicKey) {
+      return left(createMachineError('INVALID_STATE', 'Signer public key not found'));
     }
 
-    // Insert or update signers map
-    const updatedSigners = entityData.config.signers.set(
-      (newSigner.state.get('data') as { publicKey: string })?.publicKey ?? '', 
-      weight
-    );
+    // Update signers map
+    const updatedSigners = entityData.config.signers.set(signerData.publicKey, weight);
 
-    const newConfig = {
-      ...entityData.config,
-      signers: updatedSigners
-    };
-
-    // Rebuild the entity data with updated config
-    const newEntityData = {
+    // Create new entity data with updated config
+    const newEntityData: EntityStateData = {
       ...entityData,
-      config: newConfig
+      config: {
+        ...entityData.config,
+        signers: updatedSigners
+      },
+      blockHeight: entityData.blockHeight,
+      latestHash: entityData.latestHash,
+      stateRoot: createHash('sha256')
+        .update(JSON.stringify(entityData))
+        .digest('hex'),
+      nonce: entityData.nonce,
+      proposals: entityData.proposals || Map(),
+      pendingTransactions: entityData.pendingTransactions || Map(),
+      channels: entityData.channels || Map(),
+      balance: entityData.balance || BigInt(0)
     };
 
-    // Overwrite in state
+    // Update entity state
     const newState = entity.state.set(entity.id, newEntityData);
 
     const updatedEntity: EntityMachine = {
